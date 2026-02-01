@@ -42,6 +42,7 @@ mizuho-basuroke/
 └── README.md   # 本ファイル
 
 ## 👥 開発体制
+
 Project Lead / Backend / Frontend: 戸谷 (@2u8a)
 
 Edge Device: 関(@hbki3)
