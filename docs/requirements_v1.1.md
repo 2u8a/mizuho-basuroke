@@ -27,9 +27,9 @@
 
 ```mermaid
 graph LR
-    A[Edge Device<br/>(Vehicle)] -->|JSON / POST| B[Server<br/>(Firebase)]
-    B -->|Convert| C[GTFS-RT<br/>(.pb)]
-    C -->|Fetch| D[Frontend<br/>(Web App)]
+    A["Edge Device<br/>(Vehicle)"] -->|JSON / POST| B["Server<br/>(Firebase)"]
+    B -->|Convert| C["GTFS-RT<br/>(.pb)"]
+    C -->|Fetch| D["Frontend<br/>(Web App)"]
 ```
 
 ---
