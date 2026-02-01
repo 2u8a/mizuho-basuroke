@@ -34,12 +34,13 @@
 
 ```text
 mizuho-basuroke/
-├── backend/    # サーバーサイド (Firebase Functions / Python)
-├── data/       # 静的バスデータ (GTFS-JP)
-├── docs/       # 設計書、要件定義書、会議ログ
-├── edge/       # 車載器用コード (Android/IoT)
-├── frontend/   # 利用者向けWeb画面
-└── README.md   # 本ファイル
+├── backend/           # サーバーサイド (Firebase Functions / Python)
+│   └── data/
+│       └── gtfs/      # 静的バスデータ (GTFS-JP)
+├── docs/              # 設計書、要件定義書、会議ログ
+├── edge/              # 車載器用コード (Android/IoT)
+├── frontend/          # 利用者向けWeb画面
+└── README.md          # 本ファイル
 ```
 ## 👥 開発体制
 
