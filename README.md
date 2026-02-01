@@ -40,7 +40,7 @@ mizuho-basuroke/
 ├── edge/       # 車載器用コード (Android/IoT)
 ├── frontend/   # 利用者向けWeb画面
 └── README.md   # 本ファイル
-
+```
 ## 👥 開発体制
 
 Project Lead / Backend / Frontend: 戸谷 (@2u8a)
