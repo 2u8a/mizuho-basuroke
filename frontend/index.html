@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>瑞穂町コミュニティバス・ナビ</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- protobufjs (GTFS-RT decode) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/protobufjs/7.2.5/protobuf.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700&display=swap');
+        
+        body {
+            font-family: 'Noto Sans JP', sans-serif;
+            background-color: #f3f4f6;
+        }
+
+        .map-container {
+            height: 60vh;
+            background: #e5e7eb;
+            position: relative;
+            overflow: hidden;
+        }
+
+        /* 路線図のデフォルメ表現 */
+        .route-line {
+            position: absolute;
+            stroke-width: 8;
+            fill: none;
+            stroke-linecap: round;
+        }
+
+        /* アニメーションするバスアイコン */
+        .bus-marker {
+            position: absolute;
+            transition: all 2s ease-in-out;
+            z-index: 50;
+        }
+
+        .pulse-delay {
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.1); opacity: 0.8; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+
+        /* ボトムシートのスタイル */
+        .bottom-sheet {
+            height: 40vh;
+            background: white;
+            border-radius: 24px 24px 0 0;
+            box-shadow: 0 -4px 10px rgba(0,0,0,0.1);
+            padding: 20px;
+            position: relative;
+            z-index: 100;
+        }
+    </style>
+</head>
+<body class="bg-gray-100">
+
+    <!-- ヘッダー -->
+    <header class="bg-orange-500 text-white p-4 shadow-md flex justify-between items-center">
+        <h1 class="font-bold text-lg flex items-center gap-2">
+            <i data-lucide="bus"></i> 瑞穂町バス・ナビ
+        </h1>
+        <span class="text-xs bg-white text-orange-600 px-2 py-1 rounded-full font-bold">実証実験中</span>
+    </header>
+
+    <!-- マップエリア -->
+    <div class="map-container bg-slate-200">
+        <!-- 簡易的な地図背景の模様（SVG） -->
+        <svg width="100%" height="100%" viewBox="0 0 400 400" class="absolute inset-0 opacity-30">
+            <path d="M0 100 Q 100 80 200 100 T 400 100" stroke="#94a3b8" fill="none" stroke-width="2"/>
+            <path d="M50 0 L 50 400" stroke="#94a3b8" fill="none" stroke-width="1"/>
+            <path d="M300 0 L 300 400" stroke="#94a3b8" fill="none" stroke-width="1"/>
+        </svg>
+
+        <!-- 路線図（デフォルメ） -->
+        <svg width="100%" height="100%" viewBox="0 0 400 400" class="absolute inset-0">
+            <!-- 石畑・殿ヶ谷コース（オレンジ） -->
+            <path d="M50 350 L 150 250 L 250 200 L 350 50" class="route-line" stroke="#f97316" opacity="0.6"/>
+            <!-- 元狭山コース（ブルー） -->
+            <path d="M50 50 L 150 150 L 250 250 L 350 350" class="route-line" stroke="#3b82f6" opacity="0.6"/>
+            
+            <!-- バス停 -->
+            <circle cx="150" cy="250" r="6" fill="white" stroke="#f97316" stroke-width="3"/>
+            <circle cx="250" cy="200" r="6" fill="white" stroke="#f97316" stroke-width="3"/>
+            <circle cx="150" cy="150" r="6" fill="white" stroke="#3b82f6" stroke-width="3"/>
+        </svg>
+
+        <!-- 動くバスアイコン（オレンジ路線・遅延あり） -->
+        <div id="bus-orange" class="bus-marker" style="top: 230px; left: 140px;">
+            <div class="relative flex flex-col items-center">
+                <div class="bg-red-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full mb-1 shadow-lg pulse-delay">
+                    +8分遅れ
+                </div>
+                <div class="bg-orange-500 p-2 rounded-lg shadow-xl border-2 border-white">
+                    <i data-lucide="bus-front" class="text-white w-6 h-6"></i>
+                </div>
+            </div>
+        </div>
+
+        <!-- 動くバスアイコン（ブルー路線・定刻） -->
+        <div id="bus-blue" class="bus-marker" style="top: 130px; left: 130px;">
+            <div class="relative flex flex-col items-center">
+                <div class="bg-green-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full mb-1 shadow-lg">
+                    定刻
+                </div>
+                <div class="bg-blue-500 p-2 rounded-lg shadow-xl border-2 border-white">
+                    <i data-lucide="bus-front" class="text-white w-6 h-6"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ボトムシート -->
+    <div class="bottom-sheet">
+        <div class="w-12 h-1.5 bg-gray-300 rounded-full mx-auto mb-6"></div>
+        
+        <h2 class="text-gray-500 text-sm font-bold mb-4 uppercase tracking-wider">最寄りのバス停</h2>
+        
+        <div class="space-y-4">
+            <!-- バス情報カード 1 -->
+            <div class="flex items-center justify-between p-4 bg-orange-50 rounded-2xl border-l-8 border-orange-500 shadow-sm">
+                <div>
+                    <div class="text-xs text-orange-600 font-bold mb-1">石畑・殿ヶ谷コース</div>
+                    <div class="text-xl font-bold text-gray-800">箱根ケ崎駅</div>
+                </div>
+                <div class="text-right">
+                    <div class="text-sm text-gray-500">あと</div>
+                    <div class="text-2xl font-black text-red-600">約 5 分</div>
+                </div>
+            </div>
+
+            <!-- バス情報カード 2 -->
+            <div class="flex items-center justify-between p-4 bg-blue-50 rounded-2xl border-l-8 border-blue-500 shadow-sm opacity-60">
+                <div>
+                    <div class="text-xs text-blue-600 font-bold mb-1">元狭山コース</div>
+                    <div class="text-xl font-bold text-gray-800">瑞穂町役場</div>
+                </div>
+                <div class="text-right">
+                    <div class="text-sm text-gray-500">あと</div>
+                    <div class="text-2xl font-black text-gray-700">約 14 分</div>
+                </div>
+            </div>
+        </div>
+
+
+    </div>
+
+    <script>
+        // アイコンの初期化
+        lucide.createIcons();
+
+        (function () {
+            // --- 設定 ---
+            const FEED_URL = '/feed.pb';
+            const PROTO_PATH = 'proto/gtfs-realtime.proto';
+            const ROUTE_COLORS_URL = '/assets/route_colors.json';
+            const POLL_MS = 15000;
+            const VIEWBOX_SIZE = 400;
+
+            const ROUTE_POINTS = {
+                orange: [[50, 350], [150, 250], [250, 200], [350, 50]],
+                blue: [[50, 50], [150, 150], [250, 250], [350, 350]]
+            };
+
+            var FeedMessageType = null;
+            var slotByVehicleId = {};
+            var pollTimerId = null;
+            var routeColors = null;
+
+            function progressToXY(progress, route) {
+                var points = ROUTE_POINTS[route] || ROUTE_POINTS.orange;
+                if (progress <= 0) return { x: points[0][0], y: points[0][1] };
+                if (progress >= 1) return { x: points[points.length - 1][0], y: points[points.length - 1][1] };
+                var seg = (points.length - 1) * progress;
+                var i = Math.floor(seg);
+                var t = seg - i;
+                var x = points[i][0] + t * (points[i + 1][0] - points[i][0]);
+                var y = points[i][1] + t * (points[i + 1][1] - points[i][1]);
+                return { x: x, y: y };
+            }
+
+            function entityToViewModel(entity) {
+                var vehicleId = entity.id || '';
+                var tripId = '';
+                var routeId = '';
+                var delaySec = null;
+
+                if (entity.trip_update && entity.trip_update.trip) {
+                    var trip = entity.trip_update.trip;
+                    tripId = trip.trip_id || '';
+                    routeId = trip.route_id || '';
+                    if (typeof entity.trip_update.delay === 'number') {
+                        delaySec = entity.trip_update.delay;
+                    } else if (entity.trip_update.stop_time_update && entity.trip_update.stop_time_update.length > 0) {
+                        var stu = entity.trip_update.stop_time_update[0];
+                        var ev = stu.departure || stu.arrival;
+                        if (ev && typeof ev.delay === 'number') delaySec = ev.delay;
+                    }
+                }
+                if (entity.vehicle) {
+                    if (!tripId && entity.vehicle.trip && entity.vehicle.trip.trip_id)
+                        tripId = entity.vehicle.trip.trip_id;
+                    if (!routeId && entity.vehicle.trip && entity.vehicle.trip.route_id)
+                        routeId = entity.vehicle.trip.route_id;
+                    if (entity.vehicle.vehicle && entity.vehicle.vehicle.id)
+                        vehicleId = entity.vehicle.vehicle.id;
+                }
+
+                return { vehicle_id: vehicleId, trip_id: tripId, route_id: routeId, delay: delaySec, progress: 0.5 };
+            }
+
+            function assignProgress(viewModels) {
+                var n = viewModels.length;
+                for (var i = 0; i < n; i++) {
+                    viewModels[i].progress = n <= 1 ? 0.5 : (i / (n - 1)) * 0.6 + 0.2;
+                }
+            }
+
+            /**
+             * 割当安定化: route_id 優先で orange/blue を決め、無い場合は vehicle_id の初回出現順で固定。
+             * 戻り値: { orange: vm|null, blue: vm|null }
+             */
+            function assignSlots(viewModels) {
+                var slots = { orange: null, blue: null };
+                var routeIds = [];
+                var seen = {};
+                for (var i = 0; i < viewModels.length; i++) {
+                    var r = viewModels[i].route_id;
+                    if (r && !seen[r]) { seen[r] = true; routeIds.push(r); }
+                }
+                routeIds.sort();
+                var routeToSlot = {};
+                if (routeIds[0]) routeToSlot[routeIds[0]] = 'orange';
+                if (routeIds[1]) routeToSlot[routeIds[1]] = 'blue';
+
+                for (var j = 0; j < viewModels.length; j++) {
+                    var vm = viewModels[j];
+                    var slot = vm.route_id ? routeToSlot[vm.route_id] : null;
+                    if (slot && !slots[slot]) {
+                        slots[slot] = vm;
+                        continue;
+                    }
+                    if (vm.route_id) continue;
+                    var vid = vm.vehicle_id || vm.trip_id || '';
+                    if (!slotByVehicleId[vid]) {
+                        slotByVehicleId[vid] = !slots.orange ? 'orange' : (!slots.blue ? 'blue' : null);
+                    }
+                    slot = slotByVehicleId[vid];
+                    if (slot && !slots[slot]) slots[slot] = vm;
+                }
+                return slots;
+            }
+
+            /**
+             * delay 表示安定化: null=情報なし、-60〜60秒=定刻(緑)、60<delay<300=黄、>=300=赤。N分は四捨五入。
+             */
+            function delayToLabelAndClass(delaySec) {
+                if (delaySec == null) {
+                    return { text: '情報なし', className: 'bg-gray-400', pulse: false };
+                }
+                if (delaySec >= -60 && delaySec <= 60) {
+                    return { text: '定刻', className: 'bg-green-500', pulse: false };
+                }
+                var min = Math.round(delaySec / 60);
+                if (delaySec < 300) {
+                    return { text: '+' + min + '分遅れ', className: 'bg-yellow-500', pulse: true };
+                }
+                return { text: '+' + min + '分遅れ', className: 'bg-red-500', pulse: true };
+            }
+
+            function getRouteStyle(routeKey, routeId) {
+                if (routeColors && routeId && routeColors[routeId]) {
+                    var c = routeColors[routeId];
+                    return { bg: (c && c.bg) || (routeKey === 'orange' ? '#f97316' : '#3b82f6'), text: (c && c.text) || '#ffffff' };
+                }
+                return { bg: routeKey === 'orange' ? '#f97316' : '#3b82f6', text: '#ffffff' };
+            }
+
+            function updateBusMarker(markerEl, vm, routeKey) {
+                if (!vm) {
+                    markerEl.style.display = 'none';
+                    return;
+                }
+                markerEl.style.display = 'block';
+                var pos = progressToXY(vm.progress, routeKey);
+                markerEl.style.left = (pos.x / VIEWBOX_SIZE * 100) + '%';
+                markerEl.style.top = (pos.y / VIEWBOX_SIZE * 100) + '%';
+
+                var badge = markerEl.querySelector('.relative.flex.flex-col.items-center > div:first-child');
+                if (badge) {
+                    var d = delayToLabelAndClass(vm.delay);
+                    badge.textContent = d.text;
+                    badge.className = d.className + ' text-white text-[10px] font-bold px-2 py-0.5 rounded-full mb-1 shadow-lg' + (d.pulse ? ' pulse-delay' : '');
+                }
+                var iconWrap = markerEl.querySelector('.relative.flex.flex-col.items-center > div:nth-child(2)');
+                if (iconWrap) {
+                    var style = getRouteStyle(routeKey, vm.route_id);
+                    iconWrap.style.backgroundColor = style.bg;
+                    iconWrap.style.color = style.text;
+                }
+                lucide.createIcons();
+            }
+
+            function applyViewModels(slots) {
+                var busOrange = document.getElementById('bus-orange');
+                var busBlue = document.getElementById('bus-blue');
+                if (!busOrange || !busBlue) return;
+                updateBusMarker(busOrange, slots.orange, 'orange');
+                updateBusMarker(busBlue, slots.blue, 'blue');
+            }
+
+            function loadProto() {
+                return new Promise(function (resolve, reject) {
+                    protobuf.load(PROTO_PATH, function (err, root) {
+                        if (err) { reject(err); return; }
+                        FeedMessageType = root.lookupType('transit_realtime.FeedMessage');
+                        resolve();
+                    });
+                });
+            }
+
+            function loadRouteColors() {
+                return fetch(ROUTE_COLORS_URL, { cache: 'no-store' })
+                    .then(function (res) { return res.ok ? res.json() : null; })
+                    .then(function (data) { routeColors = data; })
+                    .catch(function () { routeColors = null; });
+            }
+
+            function fetchAndDecodeFeed() {
+                if (!FeedMessageType) return Promise.resolve([]);
+                return fetch(FEED_URL, { cache: 'no-store' })
+                    .then(function (res) {
+                        if (!res.ok) return [];
+                        return res.arrayBuffer();
+                    })
+                    .then(function (buf) {
+                        if (!buf || buf.byteLength === 0) return [];
+                        try {
+                            var msg = FeedMessageType.decode(new Uint8Array(buf));
+                            var entities = msg.entity || [];
+                            var list = [];
+                            for (var i = 0; i < entities.length; i++) {
+                                var e = entities[i];
+                                if (e.is_deleted) continue;
+                                if (e.vehicle || e.trip_update)
+                                    list.push(entityToViewModel(e));
+                            }
+                            assignProgress(list);
+                            return list;
+                        } catch (e) {
+                            return [];
+                        }
+                    })
+                    .catch(function () { return []; });
+            }
+
+            function poll() {
+                fetchAndDecodeFeed().then(function (viewModels) {
+                    var slots = assignSlots(viewModels);
+                    applyViewModels(slots);
+                });
+            }
+
+            function startPolling() {
+                if (pollTimerId != null) return;
+                pollTimerId = setInterval(poll, POLL_MS);
+            }
+
+            loadRouteColors().then(function () {
+                loadProto()
+                    .then(function () {
+                        poll();
+                        startPolling();
+                    })
+                    .catch(function (err) {
+                        console.error('[Module C] proto load failed:', err);
+                        applyViewModels({ orange: null, blue: null });
+                    });
+            });
+        })();
+    </script>
+</body>
+</html>

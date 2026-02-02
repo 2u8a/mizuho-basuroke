@@ -42,6 +42,11 @@ mizuho-basuroke/
 ├── frontend/          # 利用者向けWeb画面
 └── README.md          # 本ファイル
 ```
+## 📖 ドキュメント
+
+* **要件定義:** [docs/requirements_v1.1.md](docs/requirements_v1.1.md)
+* **Firebase 実装手順:** [docs/firebase_setup.md](docs/firebase_setup.md)（環境構築〜デプロイの流れ）
+
 ## 👥 開発体制
 
 Project Lead / Backend / Frontend: 戸谷 (@2u8a)
