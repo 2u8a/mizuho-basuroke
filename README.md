@@ -1,6 +1,6 @@
 # 瑞穂町コミュニティバス バスロケーションシステム（PoC）
 
-## Overview
+## 概要
 本プロジェクトは、瑞穂町コミュニティバスを対象にした  
 **1台構成のバスロケーションシステムPoC**である。
 
@@ -92,7 +92,9 @@
   "heading": 180
 }
 
-## 📖 ドキュメント
+```
+
+### 📖 ドキュメント
 
 * **要件定義:** [docs/requirements_v1.1.md](docs/requirements_v1.1.md)
 * **Firebase 実装手順:** [docs/firebase_setup.md](docs/firebase_setup.md)（環境構築〜デプロイの流れ）
