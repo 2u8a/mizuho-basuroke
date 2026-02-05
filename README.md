@@ -1,47 +1,97 @@
-# 瑞穂町コミュニティバス バスロケーションシステム (PoC)
+# 瑞穂町コミュニティバス バスロケーションシステム（PoC）
 
-瑞穂町コミュニティバスのリアルタイム位置情報を収集・配信するシステムの実証実験（PoC）プロジェクトです。
-運転手の操作を一切不要とする「完全自動運用」と、標準フォーマット「GTFS-RT」への準拠を特徴としています。
+## Overview
+本プロジェクトは、瑞穂町コミュニティバスを対象にした  
+**1台構成のバスロケーションシステムPoC**である。
 
-## 📅 プロジェクト概要
-* **プロジェクト名:** Mizuho Bus Location PoC
-* **バージョン:** 1.1
-* **期間:** 2026年3月31日までの実証実験
-* **目的:** 住民の利便性向上およびバス運行状況の可視化
+目的は、清瀬市で採用されている  
+**「GPS → GTFS-Realtime生成 → Google Maps等への提供」モデル**と同等の技術要件を満たしつつ、  
+**1台構成の場合にいくらで実現できたか**を明確に示す  
+**行政向け費用実証レポート**を作成することである。
 
-## 🚀 主な特徴
-1.  **完全自動化 (Zero Operation):**
-    * エンジン連動による自動計測・送信を実現。
-    * 運転手による端末操作を一切不要とし、現場負担をゼロにします。
-2.  **標準規格準拠 (GTFS-RT):**
-    * 世界標準フォーマットである GTFS Realtime 形式でデータを出力。
-    * 将来的なGoogleマップ連携や他アプリへの展開を考慮しています。
-3.  **サーバーサイド主導アーキテクチャ:**
-    * 複雑な座標計算や遅延判定をサーバー（Module B）に集約。
-    * フロントエンド（Module C）を軽量化し、メンテナンス性を向上させています。
+---
 
-## 🛠 システム構成
+## Scope / Out of Scope
 
-システムは以下の3つのモジュールで構成されています。
+### Scope（対象）
+- バス **1台** を対象としたPoC
+- Module A（車載）・Module B（サーバ）の設計・実装
+- Google GTFS-Realtime 仕様に準拠した feed の生成
+- 実証期間中のログ蓄積と、事後の集計・報告
 
-| モジュール | 役割 | 格納ディレクトリ | 技術スタック |
-| :--- | :--- | :--- | :--- |
-| **Module A (Edge)** | 車載器。GPS情報を収集し送信 | `/edge` | Android / IoT (ESP32) |
-| **Module B (Server)** | 運行判定、遅延計算、GTFS-RT生成 | `/backend` | Python, Firebase Functions |
-| **Module C (Frontend)** | 利用者への地図表示 | `/frontend` | HTML5, JS, TailwindCSS |
+### Out of Scope（非対象）
+- 住民向け完成UIの提供（Module C は必須ではない）
+- 複数台本格運用（将来スケールの検討はレポートで扱う）
+- 運転士による操作を前提としたUI・機器操作
 
-## 📂 ディレクトリ構造
+---
 
-```text
-mizuho-basuroke/
-├── backend/           # サーバーサイド (Firebase Functions / Python)
-│   └── data/
-│       └── gtfs/      # 静的バスデータ (GTFS-JP)
-├── docs/              # 設計書、要件定義書、会議ログ
-├── edge/              # 車載器用コード (Android/IoT)
-├── frontend/          # 利用者向けWeb画面
-└── README.md          # 本ファイル
-```
+## Key Requirements
+
+- **更新頻度**
+  - 通常時：**約10秒間隔**
+  - 通信劣化時でも **最大30秒以内**
+- **運用**
+  - 運転士操作なし（完全自動）
+  - 視界・運転操作の妨げにならない
+- **電源**
+  - 車両24V → ヒューズボックス → DC/DCコンバータ → 機器給電
+- **通信**
+  - モバイル回線（LTE / Cat-M 等）
+- **成果物**
+  - Google要件を満たす GTFS-Realtime feed
+  - 実証実験ログおよび費用・品質評価レポート
+
+---
+
+## System Architecture
+
+### Module A（車載）
+- GPS測位
+- 約10秒間隔で現在位置をサーバへ HTTPS POST
+- 運転士操作不要
+- モジュール／スマートフォン等、方式は限定しない（再現性重視）
+
+### Module B（サーバ）
+- Module A からの位置情報を受信
+- 生GPSログを保存
+- GTFS-JP と照合し GTFS-Realtime feed を生成
+- feed を外部から取得可能な形で公開
+
+### Module C（任意）
+- デモ・検証用途のフロントエンド
+- 本PoCでは必須ではない
+
+---
+
+## Repository Structure
+
+.
+├─ frontend/ # デモ・検証用フロントエンド
+├─ backend/ # Module B（Firebase Cloud Functions / Python）
+├─ docs/ # 要件定義・設計・報告書関連ドキュメント
+├─ firebase.json
+├─ .firebaserc
+└─ README.md
+
+---
+
+## Endpoints & Data Schema（A → B）
+
+### POST /gps
+車載モジュールから現在位置を送信するエンドポイント。
+
+#### JSON例
+```json
+{
+  "vehicle_id": "mizuho-bus-01",
+  "lat": 35.771234,
+  "lon": 139.353210,
+  "accuracy": 8.5,
+  "speed": 7.2,
+  "heading": 180
+}
+
 ## 📖 ドキュメント
 
 * **要件定義:** [docs/requirements_v1.1.md](docs/requirements_v1.1.md)
