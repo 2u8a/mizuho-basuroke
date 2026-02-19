@@ -87,17 +87,6 @@ https://us-central1-mizuho-basuroke-f370e.cloudfunctions.net/gtfs_rt
 
 ---
 
-## 🔐 認証方式
-
-Cloud Run 環境変数に設定：
-
-```
-API_KEY=<任意のランダム文字列>
-```
-
-* ヘッダ `X-API-KEY` が一致しない場合 401 を返す
-
----
 
 ## 🗄 Firestore構造
 

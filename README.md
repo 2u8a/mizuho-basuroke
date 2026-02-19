@@ -1,51 +1,43 @@
-# 瑞穂町コミュニティバス バスロケーションシステム（PoC）
-
-## 概要
-本プロジェクトは、瑞穂町コミュニティバスを対象にした  
-**1台構成のバスロケーションシステムPoC**である。
-
-目的は、清瀬市で採用されている  
-**「GPS → GTFS-Realtime生成 → Google Maps等への提供」モデル**と同等の技術要件を満たしつつ、  
-**1台構成の場合にいくらで実現できたか**を明確に示す  
-**行政向け費用実証レポート**を作成することである。
+# 瑞穂町コミュニティバス  
+## バスロケーションシステム（PoC）
 
 ---
 
-## Scope / Out of Scope
+## 🎯 Purpose
 
-### Scope（対象）
-- バス **1台** を対象としたPoC
-- Module A（車載）・Module B（サーバ）の設計・実装
-- Google GTFS-Realtime 仕様に準拠した feed の生成
-- 実証期間中のログ蓄積と、事後の集計・報告
+本プロジェクトは、瑞穂町コミュニティバスを対象とした  
+**1台構成のバスロケーションシステム実証（PoC）**である。
 
-### Out of Scope（非対象）
-- 住民向け完成UIの提供（Module C は必須ではない）
-- 複数台本格運用（将来スケールの検討はレポートで扱う）
-- 運転士による操作を前提としたUI・機器操作
+目的は、清瀬市で採用されている
 
----
+> **GPS → GTFS-Realtime生成 → Google Maps等への提供**
 
-## Key Requirements
+と同等の技術要件を満たしつつ、
 
-- **更新頻度**
-  - 通常時：**約10秒間隔**
-  - 通信劣化時でも **最大30秒以内**
-- **運用**
-  - 運転士操作なし（完全自動）
-  - 視界・運転操作の妨げにならない
-- **電源**
-  - 車両24V → ヒューズボックス → DC/DCコンバータ → 機器給電
-- **通信**
-  - モバイル回線（LTE / Cat-M 等）
-- **成果物**
-  - Google要件を満たす GTFS-Realtime feed
-  - 実証実験ログおよび費用・品質評価レポート
+**「1台構成でいくらで実現可能か」**  
+を明確に示すことで、行政向け費用実証レポートを作成することである。
 
 ---
 
-## System Architecture
-### 3.1 データフロー概要
+## 🧭 Scope / Out of Scope
+
+### ✅ Scope
+- バス **1台構成** のPoC
+- Module A（車載）・Module B（クラウド）の設計・実装
+- Google GTFS-Realtime仕様準拠の feed 生成
+- 実証期間中のログ蓄積
+- 費用・通信品質・更新頻度の評価
+
+### ❌ Out of Scope
+- 住民向け完成UI（Module Cは任意）
+- 複数台本格運用（将来拡張として検討）
+- 運転士操作を必要とする仕組み
+
+---
+
+## 🏗 System Architecture
+
+### データフロー概要
 
 ```mermaid
 flowchart TB
@@ -64,82 +56,125 @@ flowchart TB
   B -->|update latest| C
   D -->|read latest| C
   D -->|return feed.pb| E[GTFS-RT VehiclePosition]
-
 ````
 
-* Module A は **Firestoreへ直接書き込まず**、必ず Module B の受信APIを経由する。
-* Module B が受信データを整形し、Firestoreに「生ログ」と「最新状態」を保存する。
-* Module B は Firestore の最新状態から GTFS-RT（VehiclePosition）を生成し、外部提供可能なURLで返す。
+### 設計方針
 
-### Module A（車載）
-- GPS測位
-- 約10秒間隔で現在位置をサーバへ HTTPS POST
-- 運転士操作不要
-- モジュール／スマートフォン等、方式は限定しない（今回は再現性と安全面からモジュール）
-
-### Module B（サーバ）
-- Module A からの位置情報を受信
-- 生GPSログを保存
-- GTFS-JP と照合し GTFS-Realtime feed を生成
-- feed を外部から取得可能な形で公開
-
-### Module C（任意）
-- デモ・検証用途のフロントエンド
-- 本PoCでは必須ではない
+* Module A は **Firestoreへ直接書き込まない**
+* 必ず Module B の受信APIを経由する
+* Module B が整形・保存・GTFS-RT生成を一元管理する
 
 ---
 
-## Repository Structure
+## 🧩 Modules
 
+### Module A（車載）
+
+* GPS測位
+* 約10秒間隔で HTTPS POST
+* 運転士操作不要
+* 24V → DC/DC → 機器給電
+* LTE/Cat-M 通信
+
+### Module B（クラウド）
+
+* GPS受信API
+* Firestoreへ生ログ保存
+* GTFS-JPと照合
+* GTFS-Realtime (VehiclePosition) 生成
+* 外部取得可能なURLで公開
+
+### Module C（任意）
+
+* デモ用フロントエンド
+* 本PoCでは必須ではない
+
+---
+
+## ⚙ Key Technical Requirements
+
+* 更新頻度：通常10秒間隔（最大30秒以内）
+* 運転士操作不要（完全自動）
+* Google要件を満たすGTFS-Realtime feed
+* 実証期間ログ保存
+* 費用算出可能な構成
+
+---
+
+## 🌐 Endpoints
+
+### POST /gps
+
+車載モジュールから現在位置を送信。
+
+詳細仕様 → `docs/api-spec.md`
+
+### GET /gtfs_rt
+
+GTFS-Realtime（VehiclePosition）取得。
+
+---
+
+## 📁 Repository Structure
+
+```
 .
 │
-├─ README.md                
-│
+├─ README.md
 ├─ backend/
 │   └─ main.py
-│
 ├─ frontend/
-│
 ├─ firebase.json
 ├─ .firebaserc
 └─ docs/
-    ├─ architecture.md      ← 全体構成図
-    ├─ api-spec.md          ← GPS API仕様
-    └─ requirements.md      ← 要件定義
+    ├─ architecture.md
+    ├─ api-spec.md
+    ├─ requirements.md
+    ├─ roadmap.md
+    └─ firebase_setup.md
+```
 
 ---
 
-## Endpoints & Data Schema（A → B）
+## 📖 Documentation
 
-### POST /gps
-車載モジュールから現在位置を送信するエンドポイント。
+* 要件定義: `docs/requirements.md`
+* アーキテクチャ: `docs/architecture.md`
+* API仕様: `docs/api-spec.md`
+* Firebase構築手順: `docs/firebase_setup.md`
+* 開発ロードマップ: `docs/roadmap.md`
 
-#### JSON例
-```json
-{
-  "vehicle_id": "mizuho-bus-01",
-  "lat": 35.771234,
-  "lon": 139.353210,
-  "accuracy": 8.5,
-  "speed": 7.2,
-  "heading": 180
-}
+---
+
+## 👥 Team
+
+* Project Lead / Backend / Frontend
+  戸谷 (@2u8a)
+
+* Edge Device / Module A
+  関 (@hbki3)
+
+---
+
+## 🚀 Current Status
+
+* GPS受信API完成
+* APIキー認証実装済み
+* Firestore保存確認済み
+* GTFS-Realtime生成確認済み
+* 1台構成PoC稼働可能
+
+---
+
+## 📊 Deliverable
+
+本PoCの成果物は：
+
+1. 技術実証結果
+2. 通信品質評価
+3. 更新頻度・遅延分析
+4. 1台あたり費用試算レポート
+
+行政向け導入判断材料の提示を最終目的とする。
 
 ```
-## Technical Documentation
-
-- API仕様: docs/api-spec.md
-- データ構造: docs/data-model.md
-- 開発ロードマップ: docs/roadmap.md
-
-
-### 📖 ドキュメント
-
-* **要件定義:** [docs/requirements_v1.1.md](docs/requirements_v1.1.md)
-* **Firebase 実装手順:** [docs/firebase_setup.md](docs/firebase_setup.md)（環境構築〜デプロイの流れ）
-
-## 👥 開発体制
-
-Project Lead / Backend / Frontend: 戸谷 (@2u8a)
-
-Edge Device: 関(@hbki3)
