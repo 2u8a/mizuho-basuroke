@@ -67,12 +67,21 @@
 ## Repository Structure
 
 .
-├─ frontend/ # デモ・検証用フロントエンド
-├─ backend/ # Module B（Firebase Cloud Functions / Python）
-├─ docs/ # 要件定義・設計・報告書関連ドキュメント
+│
+├─ README.md                
+│
+├─ backend/
+│   └─ main.py
+│
+├─ frontend/
+│
 ├─ firebase.json
 ├─ .firebaserc
-└─ README.md
+└─ docs/
+    ├─ architecture.md      ← 全体構成図
+    ├─ api-spec.md          ← GPS API仕様
+    ├─ requirements.md      ← 要件定義
+
 
 ---
 
@@ -93,6 +102,12 @@
 }
 
 ```
+## Technical Documentation
+
+- API仕様: docs/api-spec.md
+- データ構造: docs/data-model.md
+- 開発ロードマップ: docs/roadmap.md
+
 
 ### 📖 ドキュメント
 
