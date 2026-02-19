@@ -36,13 +36,23 @@
 ### 3.1 データフロー概要
 
 ```mermaid
-flowchart LR
-  A[Module A: 車載GPS端末] -->|HTTPS POST /gps| B[Module B: Cloud Function(Gen2)]
-  B -->|write| D[(Firestore)]
-  B -->|GET /gtfs_rt| C[利用者/検証者]
-  C -->|HTTP GET feed.pb| B
-  B -->|read latest| D
-  B --> E[GTFS-RT feed.pb]
+flowchart TB
+  subgraph Device
+    A[Module A: Raspberry Pi + SIM]
+  end
+
+  subgraph Cloud
+    B[Cloud Functions: gps]
+    D[Cloud Functions: gtfs_rt]
+    C[Firestore]
+  end
+
+  A -->|POST /gps (JSON + X-API-KEY)| B
+  B -->|write gps_logs| C
+  B -->|update latest| C
+  D -->|read latest| C
+  D -->|return feed.pb| E[GTFS-RT VehiclePosition]
+
 ````
 
 * Module A は **Firestoreへ直接書き込まず**、必ず Module B の受信APIを経由する。
