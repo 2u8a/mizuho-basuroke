@@ -146,6 +146,34 @@ Invoke-WebRequest `
 ```
 
 ---
+## で、ラズパイにどんなの書けばいいか
+
+```python
+import requests
+from datetime import datetime, timezone
+
+url = "https://us-central1-xxxx.cloudfunctions.net/gps"
+
+headers = {
+    "Content-Type": "application/json",
+    "X-API-KEY": "APIキー"
+}
+
+data = {
+    "vehicle_id": "mizuho-bus-01",
+    "timestamp": datetime.now(timezone.utc).astimezone().isoformat(),
+    "lat": 35.77,
+    "lon": 139.34,
+    "accuracy": 8.5
+}
+
+try:
+    response = requests.post(url, json=data, headers=headers, timeout=5)
+    print(response.status_code, response.text)
+except requests.exceptions.RequestException as e:
+    print("通信エラー:", e)
+```
+---
 
 ## ⚙ 技術スタック
 
