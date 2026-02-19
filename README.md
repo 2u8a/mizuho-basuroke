@@ -80,8 +80,7 @@
 └─ docs/
     ├─ architecture.md      ← 全体構成図
     ├─ api-spec.md          ← GPS API仕様
-    ├─ requirements.md      ← 要件定義
-
+    └─ requirements.md      ← 要件定義
 
 ---
 
