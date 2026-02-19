@@ -1,6 +1,3 @@
-# 📄 README.md（Module B / GPS Ingestion API）
-
-```markdown
 # Module B – GPS Ingestion & GTFS-RT Generator
 
 このモジュールは、バス車両から送信されるGPSデータを受信し、
