@@ -47,7 +47,7 @@ flowchart TB
     C[Firestore]
   end
 
-  A -->|POST /gps (JSON + X-API-KEY)| B
+  A -->|POST /gps JSON + X-API-KEY| B
   B -->|write gps_logs| C
   B -->|update latest| C
   D -->|read latest| C
