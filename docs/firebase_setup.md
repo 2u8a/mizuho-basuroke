@@ -1,186 +1,238 @@
-# Firebase 実装手順
+# Firebase Setup Guide（Module B / Backend）
 
-瑞穂町バスロケーション PoC を Firebase で動かすための、環境構築からデプロイまでの手順です。
-
----
-
-## 1. 全体像
-
-| 役割 | Firebase サービス | 本リポジトリ |
-|------|-------------------|--------------|
-| 位置データの受信・保存 | **Realtime Database** | Edge が JSON を書き込み |
-| 運行判定・GTFS-RT 生成 | **Cloud Functions (Python)** | `backend/` |
-| Web 公開・feed.pb 配信 | **Hosting** | `frontend/` |
-
-```
-[Edge] --POST/JSON--> [Realtime Database]
-                            |
-                            v
-              [Cloud Functions] --feed.pb--> [Hosting]
-                            |
-[Frontend] <--Fetch feed.pb--+
-```
+本ドキュメントは、**現在の実装（HTTP + Cloud Functions Gen2 + Firestore）**を前提とした最新のセットアップ手順です。  
+旧ドキュメントの Realtime Database 前提構成は使用しません。
 
 ---
 
-## 2. 環境・ベースライン（開発の前提）
+# 🧭 アーキテクチャ概要
 
-以下は現時点で構築済みの環境です。今後の開発のベースとして参照してください。
+```
 
-| 項目 | 内容 |
+[Module A / Raspberry Pi]
+│
+│ HTTPS POST (X-API-KEY)
+▼
+Cloud Functions (Gen2 / Python)
+│
+├─ Firestore へ保存
+│
+└─ GTFS-RT (feed.pb) を生成
+│
+▼
+HTTP GET /gtfs_rt
+
+````
+
+---
+
+# 🔧 使用技術スタック
+
+| 役割 | 技術 |
 |------|------|
-| **Node.js** | v24.13.0（nvm で管理） |
-| **Firebase プロジェクトID** | `mizuho-basuroke-f370e` |
-| **Hosting 公開フォルダ** | `frontend` |
-| **Cloud Functions** | `backend` フォルダ、Python（firebase.json の `functions.source` = `backend`） |
-
-- `.firebaserc` の `default` が上記プロジェクトIDであること。
-- Hosting のデプロイは完了済み。Functions は `backend/` をソースとしてデプロイする。
-
----
-
-## 3. 前提条件
-
-- **Node.js** 18 以上（Firebase CLI 用）
-- **Python** 3.11 以上（Cloud Functions のローカル開発・デプロイ用。現在の設定は 3.13）
-- **Google アカウント**（Firebase プロジェクトのオーナー/編集者）
-- リポジトリをクローン済みで、ルートで作業する想定
+| サーバレスAPI | Cloud Functions (2nd Gen / Python 3.13) |
+| 実行基盤 | Cloud Run（内部） |
+| データ保存 | Firestore |
+| 認証 | API Key（環境変数） |
+| デプロイ | Firebase CLI |
+| 仮想環境 | Python venv |
 
 ---
 
-## 4. 手順
+# 1️⃣ 前提条件
 
-### ステップ 1: Firebase CLI のインストールとログイン
+- Node.js LTS
+- Python 3.11 以上（※安定版）
+- Firebase CLI
+- Google Cloud 課金有効（Blazeプラン）
+
+---
+
+# 2️⃣ プロジェクト初期化
 
 ```bash
-# CLI をグローバルにインストール
-npm install -g firebase-tools
-
-# Google アカウントでログイン
 firebase login
-```
-
-ブラウザが開くので、プロジェクトのオーナー権限があるアカウントでログインしてください。
+firebase use <project-id>
+````
 
 ---
 
-### ステップ 2: プロジェクトの確認
+# 3️⃣ Backend ディレクトリ構成
 
-```bash
-# 現在のプロジェクトを確認
-firebase projects:list
-
-# このリポジトリに紐づくプロジェクト（.firebaserc に記載）
-cat .firebaserc
 ```
-
-別のプロジェクトで試したい場合は、以下で切り替えます。
-
-```bash
-firebase use <プロジェクトID>
+backend/
+ ├─ main.py
+ ├─ requirements.txt
+ ├─ data/
+ └─ venv/
 ```
 
 ---
 
-### ステップ 3: Realtime Database を有効化
-
-1. [Firebase コンソール](https://console.firebase.google.com/) を開く
-2. 対象プロジェクト（例: `mizuho-basuroke-f370e`）を選択
-3. 左メニュー **「Build」→「Realtime Database」**
-4. **「データベースを作成」** をクリック
-   - リージョンは「asia-northeast1」（東京）を推奨
-   - 本番前に **「ルール」** タブで `database.rules.json` の内容に合わせて読み書きを制限すること
-
-開発中は `database.rules.json` のルールを緩め、本番では Edge 以外の書き込みを禁止するなど厳格にします。
-
----
-
-### ステップ 4: Cloud Functions（Python）の開発とデプロイ
-
-Cloud Functions のソースは **`backend/`** です（firebase.json の `source: "backend"`）。
-
-#### 4-1. 仮想環境と依存関係（初回のみ）
+# 4️⃣ Python 仮想環境のセットアップ
 
 ```bash
 cd backend
-python3 -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-cd ..
+py -3.11 -m venv venv
+venv\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-#### 4-2. ローカルで動作確認（任意）
+---
 
-```bash
-# エミュレータで Functions のみ起動
-firebase emulators:start --only functions
+# 5️⃣ requirements.txt
+
+```txt
+firebase-functions
+functions-framework==3.5.0
+firebase-admin
+gtfs-realtime-bindings
 ```
 
-#### 4-3. デプロイ
+---
+
+# 6️⃣ main.py の基本構造
+
+```python
+import os
+import firebase_admin
+from firebase_admin import firestore
+from firebase_functions import https_fn
+
+firebase_admin.initialize_app()
+db = firestore.client()
+
+API_KEY = os.environ.get("API_KEY")
+
+@https_fn.on_request()
+def gps(req):
+    key = req.headers.get("X-API-KEY")
+    if key != API_KEY:
+        return ("Unauthorized", 401)
+
+    data = req.get_json()
+    db.collection("gps_logs").add(data)
+
+    return {"ok": True}
+
+@https_fn.on_request()
+def gtfs_rt(req):
+    return ("binary-data", 200, {"Content-Type": "application/x-protobuf"})
+```
+
+---
+
+# 7️⃣ デプロイ
 
 ```bash
-# リポジトリルートで実行
 firebase deploy --only functions
 ```
 
-- GTFS-JP は **`backend/data/gtfs/`** に配置されています。デプロイ時には `backend/` 一式がアップロードされるため、Functions 内から `./data/gtfs/` で参照できます。
+成功すると以下のURLが発行される：
 
----
-
-### ステップ 5: Hosting（フロントエンド）のデプロイ
-
-```bash
-# フロントエンドのみデプロイ
-firebase deploy --only hosting
+```
+https://us-central1-<project-id>.cloudfunctions.net/gps
+https://us-central1-<project-id>.cloudfunctions.net/gtfs_rt
 ```
 
-- 公開先は `frontend/` ディレクトリの内容です。
-- デプロイ後、コンソールの **Hosting** に表示される URL（例: `https://mizuho-basuroke-f370e.web.app`）でアクセスできます。
-
 ---
 
-### ステップ 6: 一括デプロイ（Functions + Hosting + Database ルール）
+# 8️⃣ APIキー設定（Cloud Run）
 
-```bash
-# すべてまとめてデプロイ
-firebase deploy
+Cloud Functions Gen2 は Cloud Run 上で動作します。
+
+### 手順
+
+1. Google Cloud Console を開く
+2. Cloud Run → 対象サービス（gps）
+3. 編集してデプロイ
+4. 環境変数追加
+
+```
+KEY: API_KEY
+VALUE: 任意の長い文字列
 ```
 
-- **Functions**・**Hosting**・**Database のルール**（`database.rules.json`）が一度に反映されます。
-- Database のルールだけ更新したい場合は `firebase deploy --only database` を使います。
+保存して再デプロイ。
 
 ---
 
-## 5. よく使うコマンド一覧
+# 9️⃣ 動作確認
 
-| 目的 | コマンド |
-|------|----------|
-| ログイン確認 | `firebase login:list` |
-| 使用プロジェクト確認 | `firebase use` |
-| Functions のみデプロイ | `firebase deploy --only functions` |
-| Hosting のみデプロイ | `firebase deploy --only hosting` |
-| Database ルールのみデプロイ | `firebase deploy --only database` |
-| 全デプロイ | `firebase deploy` |
-| エミュレータ（Functions） | `firebase emulators:start --only functions` |
+## ❌ ヘッダーなし（401になる）
 
----
+```bash
+curl -X POST <gps-url>
+```
 
-## 6. 注意事項
+## ✅ 正しいキー付き（200になる）
 
-- **Realtime Database のルール**  
-  本番では、書き込みは認証済みの Edge 端末（または Cloud Functions 経由）に限定し、読み取りは必要最小限にしてください。
-- **GTFS の参照**  
-  Cloud Functions のソースは `backend/` です。`backend/data/gtfs/` はデプロイ時に一緒にアップロードされるため、コード内では `./data/gtfs/` で参照できます。
-- **Blaze プラン**  
-  Cloud Functions を使うには、Firebase の **Blaze（従量課金）** プランが必要です。無料枠内で収まるよう、関数の呼び出し回数・実行時間は設計で考慮してください。
+```bash
+curl -X POST <gps-url> \
+ -H "X-API-KEY: <your-key>" \
+ -H "Content-Type: application/json" \
+ -d '{"vehicle_id":"bus-01","lat":35.0,"lon":139.0}'
+```
 
 ---
 
-## 7. 次のステップ（実装順の目安）
+# 🔟 Firestore構造
 
-1. **B-01**: Realtime Database に Edge が書き込むデータ構造を決め、ルールを書く
-2. **B-02〜B-04**: Cloud Functions で運行判定・遅延計算・GTFS-RT（feed.pb）生成を実装
-3. **B-05**: Hosting で `feed.pb` を配信する URL を用意（Functions で生成した .pb を Storage に書き、Hosting から参照するか、Functions の HTTP エンドポイントで返すかは設計で決定）
-4. **C-01〜C-04**: フロントエンドで `feed.pb` を取得・表示
+```
+gps_logs (collection)
+ ├─ auto-id
+ │    ├─ vehicle_id
+ │    ├─ timestamp
+ │    ├─ lat
+ │    ├─ lon
+ │    ├─ accuracy
+ │    └─ speed (optional)
+```
 
-要件の詳細は `docs/requirements_v1.1.md` を参照してください。
+---
+
+# 🔐 セキュリティ方針
+
+* APIキー必須
+* キーは公開リポジトリに含めない
+* Module A 側は環境変数または .env 管理
+* Firestore ルールはサーバー専用アクセス
+
+---
+
+# 💰 課金について
+
+本構成は Blaze（従量課金）前提。
+
+主な課金対象：
+
+* Firestore 書き込み回数
+* Cloud Run 実行時間
+* ネットワーク転送量
+
+PoC規模では月数百円程度。
+
+---
+
+# 📍 今後の拡張
+
+* JPFS-JP照合ロジック追加
+* 便特定アルゴリズム
+* 遅延算出
+* TripUpdate / VehiclePosition 対応
+* Google Transit 提供用正式GTFS-RT出力
+
+---
+
+# 🎯 現在の正しい設計
+
+本プロジェクトは **HTTP + Firestore 構成を正式仕様とする。**
+
+Realtime Database は使用しない。
+
+---
+
+End of Document
+
+```
