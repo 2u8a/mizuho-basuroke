@@ -7,27 +7,30 @@ Firestoreに保存し、GTFS-Realtime (VehiclePosition) を生成するAPIサー
 
 ## 🏗 全体構成
 
-```
+```mermaid
+flowchart TB
+  subgraph Device
+    A[Module A: Raspberry Pi + SIM]
+  end
 
-[Module A (Raspberry Pi)]
-│
-│ HTTP POST (GPS JSON)
-▼
-[Cloud Functions (Gen2)]
-│
-├─ 認証チェック（API_KEY）
-├─ データ整形 / 異常値判定
-├─ 生ログ保存
-▼
-[Firestore]
-│
-▼
-[GET /gtfs_rt]
-│
-▼
-GTFS-Realtime (feed.pb)
+  subgraph Cloud
+    B[Cloud Functions: gps]
+    D[Cloud Functions: gtfs_rt]
+    C[Firestore]
+  end
 
-```
+  A -->|POST /gps JSON + X-API-KEY| B
+  B -->|write gps_logs| C
+  B -->|update latest| C
+  D -->|read latest| C
+  D -->|return feed.pb| E[GTFS-RT VehiclePosition]
+
+````
+
+* Module A は **Firestoreへ直接書き込まず**、必ず Module B の受信APIを経由する。
+* Module B が受信データを整形し、Firestoreに「生ログ」と「最新状態」を保存する。
+* Module B は Firestore の最新状態から GTFS-RT（VehiclePosition）を生成し、外部提供可能なURLで返す。Realtime (feed.pb)
+
 
 ---
 

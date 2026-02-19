@@ -45,12 +45,37 @@
 ---
 
 ## System Architecture
+### 3.1 データフロー概要
+
+```mermaid
+flowchart TB
+  subgraph Device
+    A[Module A: Raspberry Pi + SIM]
+  end
+
+  subgraph Cloud
+    B[Cloud Functions: gps]
+    D[Cloud Functions: gtfs_rt]
+    C[Firestore]
+  end
+
+  A -->|POST /gps JSON + X-API-KEY| B
+  B -->|write gps_logs| C
+  B -->|update latest| C
+  D -->|read latest| C
+  D -->|return feed.pb| E[GTFS-RT VehiclePosition]
+
+````
+
+* Module A は **Firestoreへ直接書き込まず**、必ず Module B の受信APIを経由する。
+* Module B が受信データを整形し、Firestoreに「生ログ」と「最新状態」を保存する。
+* Module B は Firestore の最新状態から GTFS-RT（VehiclePosition）を生成し、外部提供可能なURLで返す。
 
 ### Module A（車載）
 - GPS測位
 - 約10秒間隔で現在位置をサーバへ HTTPS POST
 - 運転士操作不要
-- モジュール／スマートフォン等、方式は限定しない（再現性重視）
+- モジュール／スマートフォン等、方式は限定しない（今回は再現性と安全面からモジュール）
 
 ### Module B（サーバ）
 - Module A からの位置情報を受信
