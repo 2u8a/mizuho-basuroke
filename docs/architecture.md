@@ -37,7 +37,7 @@
 
 ```mermaid
 flowchart LR
-  A[Module A: 車載GPS端末] -->|HTTPS POST /gps| B[Module B: Cloud Functions (Gen2)]
+  A[Module A: 車載GPS端末] -->|HTTPS POST /gps| B[Module B: Cloud Function(Gen2)]
   B -->|write| D[(Firestore)]
   B -->|GET /gtfs_rt| C[利用者/検証者]
   C -->|HTTP GET feed.pb| B
