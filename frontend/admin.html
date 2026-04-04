@@ -21,7 +21,7 @@
     --bg: #0f172a; --panel: #1e293b; --border: #334155;
     --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8;
     --ok: #34d399; --warn: #fbbf24; --err: #f87171;
-    --route1: #FF0000; --route2: #4488FF; --route3: #FFC000;
+    --route1: #FF0000; --route2: #4488FF; --route3: #FFC000; --route4: #CCFF66; --route5: #800080;
   }
   * { margin:0; padding:0; box-sizing:border-box; }
   body { background:var(--bg); color:var(--text); font-family:'Segoe UI','Hiragino Sans',sans-serif; font-size:13px; height:100vh; display:flex; flex-direction:column; overflow:hidden; }
@@ -113,6 +113,8 @@
       <div class="legend-row"><div class="legend-line" style="background:var(--route1)"></div>元狭山コース</div>
       <div class="legend-row"><div class="legend-line" style="background:var(--route2)"></div>元狭山・長岡コース</div>
       <div class="legend-row"><div class="legend-line" style="background:var(--route3)"></div>石畑・殿ケ谷コース</div>
+      <div class="legend-row"><div class="legend-line" style="background:var(--route4)"></div>ふれあいセンターコース</div>
+      <div class="legend-row"><div class="legend-line" style="background:var(--route5)"></div>箱根ケ崎駅東口循環コース</div>
     </div>
   </div>
 
@@ -199,15 +201,13 @@
 // ============================================================
 // CONFIG — ★ ここにFirebase設定を入れてください
 // ============================================================
-const firebaseConfig = {
-  apiKey: "AIzaSyBwo9qNc_lr9aruVvIXRoLGjtM7pbjRoD4",
-  authDomain: "mizuho-basuroke-f370e.firebaseapp.com",
-  databaseURL: "https://mizuho-basuroke-f370e-default-rtdb.asia-southeast1.firebasedatabase.app",
-  projectId: "mizuho-basuroke-f370e",
-  storageBucket: "mizuho-basuroke-f370e.firebasestorage.app",
-  messagingSenderId: "352170837881",
-  appId: "1:352170837881:web:76896e67d6d76ceaf991a8",
-  measurementId: "G-2P0L9E4FBJ"
+const FIREBASE_CONFIG = {
+  apiKey:            "YOUR_API_KEY",
+  authDomain:        "mizuho-basuroke-f370e.firebaseapp.com",
+  projectId:         "mizuho-basuroke-f370e",
+  storageBucket:     "mizuho-basuroke-f370e.appspot.com",
+  messagingSenderId: "YOUR_SENDER_ID",
+  appId:             "YOUR_APP_ID",
 };
 
 const VEHICLE_ID   = "mizuho-bus-01";
@@ -215,7 +215,7 @@ const GTFS_RT_URL  = "https://us-central1-mizuho-basuroke-f370e.cloudfunctions.n
 const FEED_POLL_MS = 10000;
 const LOG_MAX      = 80;
 
-const ROUTE_COLORS = { "1": "#FF0000", "2": "#4488FF", "3": "#FFC000" };
+const ROUTE_COLORS = { "1": "#FF0000", "2": "#4488FF", "3": "#FFC000", "4": "#CCFF66", "5": "#800080" };
 
 // ============================================================
 // MAP DATA (inline — preprocessed from GTFS)
