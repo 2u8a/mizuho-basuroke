@@ -26,7 +26,6 @@
   * { margin:0; padding:0; box-sizing:border-box; }
   body { background:var(--bg); color:var(--text); font-family:'Segoe UI','Hiragino Sans',sans-serif; font-size:13px; height:100vh; display:flex; flex-direction:column; overflow:hidden; }
 
-  /* header */
   header { display:flex; align-items:center; justify-content:space-between; padding:8px 16px; background:var(--panel); border-bottom:1px solid var(--border); flex-shrink:0; }
   header h1 { font-size:15px; font-weight:700; }
   header h1 span { color:var(--accent); }
@@ -35,43 +34,34 @@
   .conn-dot.on { background:var(--ok); box-shadow:0 0 6px var(--ok); }
   .conn-dot.off { background:var(--err); }
 
-  /* main layout */
   .main { display:flex; flex:1; overflow:hidden; }
-
-  /* left = map */
   .map-wrap { flex:1; min-width:0; position:relative; }
   #map { width:100%; height:100%; }
   .map-overlay { position:absolute; top:10px; left:50px; z-index:600; background:rgba(15,23,42,.85); border:1px solid var(--border); border-radius:8px; padding:8px 12px; font-size:11px; backdrop-filter:blur(4px); }
   .map-overlay .legend-row { display:flex; align-items:center; gap:6px; margin:2px 0; }
   .legend-line { width:20px; height:3px; border-radius:2px; }
 
-  /* right panel */
   .side { width:380px; flex-shrink:0; display:flex; flex-direction:column; border-left:1px solid var(--border); overflow-y:auto; }
   .card { background:var(--panel); border-bottom:1px solid var(--border); padding:12px 14px; }
   .card-title { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin-bottom:8px; display:flex; align-items:center; gap:6px; }
   .card-title .icon { font-size:14px; }
 
-  /* KV grid */
   .kv { display:grid; grid-template-columns:110px 1fr; gap:2px 8px; font-size:12px; }
   .kv dt { color:var(--muted); }
   .kv dd { font-family:'JetBrains Mono',monospace; word-break:break-all; }
 
-  /* delay big display */
   .delay-box { text-align:center; padding:12px 0; }
   .delay-value { font-size:42px; font-weight:800; line-height:1; }
   .delay-unit { font-size:14px; color:var(--muted); }
   .delay-label { font-size:11px; color:var(--muted); margin-top:4px; }
 
-  /* progress bar */
   .progress-track { height:6px; background:var(--border); border-radius:3px; margin:8px 0; position:relative; }
   .progress-fill { height:100%; border-radius:3px; transition:width .6s ease; }
   .progress-expected { position:absolute; top:-2px; width:2px; height:10px; background:var(--accent); border-radius:1px; }
 
-  /* feed status */
   .feed-row { display:flex; align-items:center; gap:8px; padding:4px 0; font-size:12px; }
   .feed-dot { width:6px; height:6px; border-radius:50%; flex-shrink:0; }
 
-  /* GPS log */
   .log-wrap { flex-shrink:0; height:220px; border-top:1px solid var(--border); display:flex; flex-direction:column; }
   .log-header { padding:6px 14px; background:var(--panel); border-bottom:1px solid var(--border); font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); display:flex; align-items:center; gap:6px; }
   .log-scroll { flex:1; overflow-y:auto; font-family:'JetBrains Mono',monospace; font-size:11px; line-height:1.6; }
@@ -83,11 +73,15 @@
   .tag-ok { background:rgba(52,211,153,.15); color:var(--ok); }
   .tag-ng { background:rgba(248,113,113,.15); color:var(--err); }
   .tag-trip { background:rgba(56,189,248,.15); color:var(--accent); }
+  .tag-lock { background:rgba(251,191,36,.15); color:var(--warn); }
 
-  /* debug separator */
   .kv-sep { grid-column: 1 / -1; border-top:1px dashed var(--border); margin:4px 0; }
 
-  /* responsive */
+  /* route lock badge */
+  .lock-badge { display:inline-flex; align-items:center; gap:4px; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
+  .lock-badge.locked { background:rgba(52,211,153,.15); color:var(--ok); border:1px solid var(--ok); }
+  .lock-badge.unlocked { background:rgba(148,163,184,.1); color:var(--muted); border:1px solid var(--border); }
+
   @media (max-width:900px) {
     .main { flex-direction:column; }
     .side { width:100%; max-height:45vh; }
@@ -108,8 +102,6 @@
 </header>
 
 <div class="main">
-
-  <!-- ===== MAP ===== -->
   <div class="map-wrap">
     <div id="map"></div>
     <div class="map-overlay" id="mapLegend">
@@ -121,7 +113,6 @@
     </div>
   </div>
 
-  <!-- ===== SIDE PANEL ===== -->
   <div class="side">
 
     <!-- GPS受信 -->
@@ -137,7 +128,7 @@
       </dl>
     </div>
 
-    <!-- 遅延 -->
+    <!-- 遅延判定 -->
     <div class="card">
       <div class="card-title"><span class="icon">⏱</span> 遅延判定</div>
       <div class="delay-box">
@@ -145,6 +136,20 @@
         <div class="delay-unit">分</div>
         <div class="delay-label" id="delayLabel">便マッチなし</div>
       </div>
+    </div>
+
+    <!-- ルートロック -->
+    <div class="card">
+      <div class="card-title"><span class="icon">🔒</span> ルートロック</div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+        <span class="lock-badge unlocked" id="lockBadge">UNLOCKED</span>
+        <span id="lockRouteLabel" style="font-size:12px;color:var(--muted);">--</span>
+      </div>
+      <dl class="kv">
+        <dt>lock_route</dt><dd id="lockRoute">--</dd>
+        <dt>lock_trip</dt><dd id="lockTrip">--</dd>
+        <dt>consecutive</dt><dd id="lockConsecutive">--</dd>
+      </dl>
     </div>
 
     <!-- 便推定 -->
@@ -161,7 +166,6 @@
         <dt>offset (横ずれ)</dt><dd id="tripOffset">--</dd>
         <dt>score</dt><dd id="tripScore">--</dd>
 
-        <!-- debug section -->
         <div class="kv-sep"></div>
         <dt>debug_reason</dt><dd id="tripDebugReason">--</dd>
         <dt>candidate_count</dt><dd id="tripCandidateCount">--</dd>
@@ -202,10 +206,9 @@
       </div>
     </div>
 
-  </div><!-- /side -->
-</div><!-- /main -->
+  </div>
+</div>
 
-<!-- ===== GPS LOG ===== -->
 <div class="log-wrap">
   <div class="log-header">📋 GPSログ (リアルタイム)</div>
   <div class="log-scroll" id="logScroll"></div>
@@ -213,7 +216,7 @@
 
 <script>
 // ============================================================
-// CONFIG — ☆ ここにFirebase設定を入れてください
+// CONFIG
 // ============================================================
 const FIREBASE_CONFIG = {
   apiKey:            "YOUR_API_KEY",
@@ -228,21 +231,17 @@ const VEHICLE_ID   = "mizuho-bus-01";
 const GTFS_RT_URL  = "https://us-central1-mizuho-basuroke-f370e.cloudfunctions.net/gtfs_rt";
 const FEED_POLL_MS = 10000;
 const LOG_MAX      = 80;
-
 const ROUTE_COLORS = { "1": "#FF0000", "2": "#4488FF", "3": "#FFC000", "4": "#CCFF66", "5": "#800080" };
 
-// ============================================================
-// MAP DATA (inline — preprocessed from GTFS)
-// ============================================================
-let MAP_DATA = null; // loaded async
+let MAP_DATA = null;
+let db = null;
+let unsubLatest = null;
+let unsubLogs = null;
+let lastState = null;
 
 // ============================================================
 // Firebase init
 // ============================================================
-let db = null;
-let unsubLatest = null;
-let unsubLogs = null;
-
 function initFirebase() {
   try {
     firebase.initializeApp(FIREBASE_CONFIG);
@@ -259,15 +258,13 @@ function initFirebase() {
 // ============================================================
 // Firestore listeners
 // ============================================================
-let lastState = null;
-
 function startListeners() {
-  // latest state
   unsubLatest = db.doc(`vehicles/${VEHICLE_ID}/state/latest`).onSnapshot(snap => {
     if (!snap.exists) return;
     lastState = snap.data();
     updateGpsPanel(lastState);
     updateTripPanel(lastState);
+    updateRouteLockPanel(lastState);
     updateMapPosition(lastState);
   }, err => {
     console.error("latest listener error:", err);
@@ -275,7 +272,6 @@ function startListeners() {
     document.getElementById("connLabel").textContent = "リスナーエラー";
   });
 
-  // gps_logs (latest 10)
   unsubLogs = db.collection("gps_logs")
     .orderBy("timestamp_unix", "desc")
     .limit(10)
@@ -309,6 +305,41 @@ function updateGpsPanel(s) {
 }
 
 // ============================================================
+// UI: Route Lock Panel
+// ============================================================
+function updateRouteLockPanel(s) {
+  const dbg = s.trip_debug || {};
+  const rl = dbg.route_lock || (s.route_lock ? {
+    locked: s.route_lock.locked,
+    route_id: s.route_lock.route_id,
+    trip_id: s.route_lock.trip_id,
+    consecutive: s.route_lock.consecutive,
+  } : null);
+
+  const badge = document.getElementById("lockBadge");
+  const label = document.getElementById("lockRouteLabel");
+
+  if (rl && rl.locked) {
+    badge.textContent = "🔒 LOCKED";
+    badge.className = "lock-badge locked";
+    const color = ROUTE_COLORS[rl.route_id] || "#fff";
+    label.innerHTML = `<span style="color:${color}">route ${rl.route_id}</span>`;
+  } else if (rl && rl.route_id) {
+    badge.textContent = "🔓 tracking";
+    badge.className = "lock-badge unlocked";
+    label.textContent = `route ${rl.route_id} (${rl.consecutive || 0}回)`;
+  } else {
+    badge.textContent = "— none";
+    badge.className = "lock-badge unlocked";
+    label.textContent = "--";
+  }
+
+  document.getElementById("lockRoute").textContent = rl && rl.route_id ? rl.route_id : "--";
+  document.getElementById("lockTrip").textContent = rl && rl.trip_id ? rl.trip_id : "--";
+  document.getElementById("lockConsecutive").textContent = rl ? String(rl.consecutive || 0) : "--";
+}
+
+// ============================================================
 // UI: Trip Panel (with debug)
 // ============================================================
 function updateTripPanel(s) {
@@ -316,7 +347,6 @@ function updateTripPanel(s) {
   const dbg = s.trip_debug || {};
   const best = dbg.top_candidate || {};
 
-  // --- debug fields (always update) ---
   const debugReasonEl = document.getElementById("tripDebugReason");
   const candidateCountEl = document.getElementById("tripCandidateCount");
   const bestTripEl = document.getElementById("tripBestTrip");
@@ -327,7 +357,6 @@ function updateTripPanel(s) {
   const bestRejectEl = document.getElementById("tripBestReject");
 
   if (!t || !t.trip_id) {
-    // --- trip なし ---
     document.getElementById("tripId").textContent = "--";
     document.getElementById("tripRoute").textContent = "--";
     document.getElementById("tripStatus").textContent = "--";
@@ -340,33 +369,26 @@ function updateTripPanel(s) {
 
     debugReasonEl.textContent = dbg.reason || "--";
     debugReasonEl.style.color = dbg.reason ? "var(--err)" : "var(--muted)";
-    candidateCountEl.textContent =
-      dbg.candidate_trip_count != null ? String(dbg.candidate_trip_count) : "--";
+    candidateCountEl.textContent = dbg.candidate_trip_count != null ? String(dbg.candidate_trip_count) : "--";
 
     bestTripEl.textContent = best.trip_id || "--";
     bestRouteEl.textContent = best.route_id || "--";
     bestShapeEl.textContent = best.shape_id || "--";
-    bestOffsetEl.textContent =
-      best.projection_offset_m != null ? `${Number(best.projection_offset_m).toFixed(1)} m` : "--";
-    bestOffsetEl.style.color =
-      best.projection_offset_m != null && best.projection_offset_m > 250 ? "var(--err)" : "var(--muted)";
-    bestErrorEl.textContent =
-      best.distance_error_m != null ? `${Number(best.distance_error_m).toFixed(1)} m` : "--";
-    bestErrorEl.style.color =
-      best.distance_error_m != null && best.distance_error_m > 1000 ? "var(--err)" : "var(--muted)";
+    bestOffsetEl.textContent = best.projection_offset_m != null ? `${Number(best.projection_offset_m).toFixed(1)} m` : "--";
+    bestOffsetEl.style.color = best.projection_offset_m != null && best.projection_offset_m > 250 ? "var(--err)" : "var(--muted)";
+    bestErrorEl.textContent = best.distance_error_m != null ? `${Number(best.distance_error_m).toFixed(1)} m` : "--";
+    bestErrorEl.style.color = best.distance_error_m != null && best.distance_error_m > 1000 ? "var(--err)" : "var(--muted)";
     bestRejectEl.textContent = best.reject_reason || "--";
     bestRejectEl.style.color = best.reject_reason ? "var(--err)" : "var(--muted)";
 
     document.getElementById("delayValue").textContent = "--";
-    document.getElementById("delayLabel").textContent =
-      dbg.reason ? `便マッチなし: ${dbg.reason}` : "便マッチなし";
+    document.getElementById("delayLabel").textContent = dbg.reason ? `便マッチなし: ${dbg.reason}` : "便マッチなし";
     document.getElementById("delayValue").style.color = "var(--muted)";
     document.getElementById("progressFill").style.width = "0%";
     document.getElementById("progressPct").textContent = "--%";
     return;
   }
 
-  // --- trip あり ---
   document.getElementById("tripId").textContent = t.trip_id;
   document.getElementById("tripRoute").innerHTML =
     `<span style="color:${ROUTE_COLORS[t.route_id]||'#fff'}">${t.route_name || t.route_id}</span>`;
@@ -381,44 +403,33 @@ function updateTripPanel(s) {
   const err = t.distance_error_m;
   const errEl = document.getElementById("tripDistError");
   errEl.textContent = err != null ? `${Number(err).toFixed(0)} m` : "--";
-  if (err != null) {
-    errEl.style.color = err < 200 ? "var(--ok)" : err < 500 ? "var(--warn)" : "var(--err)";
-  }
+  if (err != null) errEl.style.color = err < 200 ? "var(--ok)" : err < 500 ? "var(--warn)" : "var(--err)";
 
   document.getElementById("tripOffset").textContent =
     t.projection_offset_m != null ? `${Number(t.projection_offset_m).toFixed(1)} m` : "--";
   document.getElementById("tripScore").textContent =
     t.score != null ? Number(t.score).toFixed(1) : "--";
 
-  // debug (trip ありの場合)
   debugReasonEl.textContent = "matched ✓";
   debugReasonEl.style.color = "var(--ok)";
-  candidateCountEl.textContent =
-    dbg.candidate_trip_count != null ? String(dbg.candidate_trip_count) : "--";
+  candidateCountEl.textContent = dbg.candidate_trip_count != null ? String(dbg.candidate_trip_count) : "--";
   bestTripEl.textContent = t.trip_id;
   bestRouteEl.textContent = t.route_id;
   bestShapeEl.textContent = t.shape_id || "--";
-  bestOffsetEl.textContent =
-    t.projection_offset_m != null ? `${Number(t.projection_offset_m).toFixed(1)} m` : "--";
+  bestOffsetEl.textContent = t.projection_offset_m != null ? `${Number(t.projection_offset_m).toFixed(1)} m` : "--";
   bestOffsetEl.style.color = "var(--ok)";
-  bestErrorEl.textContent =
-    t.distance_error_m != null ? `${Number(t.distance_error_m).toFixed(1)} m` : "--";
+  bestErrorEl.textContent = t.distance_error_m != null ? `${Number(t.distance_error_m).toFixed(1)} m` : "--";
   bestErrorEl.style.color = "var(--ok)";
   bestRejectEl.textContent = "none (matched)";
   bestRejectEl.style.color = "var(--ok)";
 
-  // delay
   const delaySec = t.delay_sec || 0;
   const delayMin = (delaySec / 60).toFixed(1);
   const dvEl = document.getElementById("delayValue");
   dvEl.textContent = (delaySec >= 0 ? "+" : "") + delayMin;
-  dvEl.style.color =
-    Math.abs(delaySec) < 60 ? "var(--ok)" :
-    Math.abs(delaySec) < 180 ? "var(--warn)" : "var(--err)";
-  document.getElementById("delayLabel").textContent =
-    delaySec > 60 ? "遅延" : delaySec < -60 ? "早着" : "定時";
+  dvEl.style.color = Math.abs(delaySec) < 60 ? "var(--ok)" : Math.abs(delaySec) < 180 ? "var(--warn)" : "var(--err)";
+  document.getElementById("delayLabel").textContent = delaySec > 60 ? "遅延" : delaySec < -60 ? "早着" : "定時";
 
-  // progress
   const maxDist = Math.max(t.current_distance_m || 0, t.expected_distance_m || 0, 1) * 1.3 + 500;
   const curPct = Math.min(100, Math.max(0, (t.current_distance_m || 0) / maxDist * 100));
   const expPct = Math.min(100, Math.max(0, (t.expected_distance_m || 0) / maxDist * 100));
@@ -444,8 +455,14 @@ function updateLogPanel(logs) {
     } else if (l.trip_debug && l.trip_debug.reason) {
       tripTag = `<span class="log-tag tag-ng" style="font-size:9px;">${l.trip_debug.reason}</span>`;
     }
+    // route lock indicator in log
+    let lockTag = "";
+    const rl = l.trip_debug?.route_lock;
+    if (rl && rl.locked) {
+      lockTag = `<span class="log-tag tag-lock">🔒R${rl.route_id}</span>`;
+    }
     const body = `lat=${Number(l.lat||0).toFixed(5)} lon=${Number(l.lon||0).toFixed(5)} acc=${l.accuracy||"?"}`;
-    return `<div class="log-entry"><span class="log-time">${t}</span>${tag}${tripTag}<span class="log-body">${body}</span></div>`;
+    return `<div class="log-entry"><span class="log-time">${t}</span>${tag}${tripTag}${lockTag}<span class="log-body">${body}</span></div>`;
   }).join("");
   el.innerHTML = html;
 }
@@ -458,22 +475,18 @@ let map, busMarker, busCircle, shapeLayers = [], stopMarkers = [];
 function initMap() {
   map = L.map("map", { zoomControl: true }).setView([35.778, 139.350], 14);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    attribution: '&copy; OpenStreetMap contributors',
-    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors', maxZoom: 19,
   }).addTo(map);
 
-  // bus marker
   const busIcon = L.divIcon({
     className: "",
     html: '<div style="background:#38bdf8;width:16px;height:16px;border-radius:50%;border:3px solid #fff;box-shadow:0 0 8px rgba(56,189,248,.6);"></div>',
-    iconSize: [16,16],
-    iconAnchor: [8,8],
+    iconSize: [16,16], iconAnchor: [8,8],
   });
   busMarker = L.marker([35.778, 139.350], { icon: busIcon, zIndex: 1000 }).addTo(map);
   busCircle = L.circle([35.778, 139.350], { radius: 30, color: "#38bdf8", fillOpacity: 0.1, weight: 1 }).addTo(map);
   busMarker.setOpacity(0);
   busCircle.setStyle({ opacity: 0 });
-
   loadMapData();
 }
 
@@ -484,20 +497,18 @@ async function loadMapData() {
     drawRoutes();
     drawStops();
   } catch(e) {
-    console.warn("gtfs_map_data.json load failed, using inline fallback", e);
+    console.warn("gtfs_map_data.json load failed", e);
   }
 }
 
 function drawRoutes() {
   if (!MAP_DATA) return;
-  const routeShapes = MAP_DATA.route_shapes;
-  for (const [routeId, shapeIds] of Object.entries(routeShapes)) {
+  for (const [routeId, shapeIds] of Object.entries(MAP_DATA.route_shapes)) {
     const color = ROUTE_COLORS[routeId] || "#888";
     for (const sid of shapeIds) {
       const coords = MAP_DATA.shapes[sid];
       if (!coords) continue;
-      const layer = L.polyline(coords, { color, weight: 3, opacity: 0.6 }).addTo(map);
-      shapeLayers.push(layer);
+      shapeLayers.push(L.polyline(coords, { color, weight: 3, opacity: 0.6 }).addTo(map));
     }
   }
 }
@@ -522,10 +533,8 @@ function updateMapPosition(s) {
   const lat = Number(s.lat), lon = Number(s.lon);
   busMarker.setLatLng([lat, lon]).setOpacity(1);
   busCircle.setLatLng([lat, lon]);
-  const acc = Number(s.accuracy || 30);
-  busCircle.setRadius(acc).setStyle({ opacity: 0.5 });
+  busCircle.setRadius(Number(s.accuracy || 30)).setStyle({ opacity: 0.5 });
 
-  // color by route
   const routeId = s.trip?.route_id;
   const color = ROUTE_COLORS[routeId] || "#38bdf8";
   busMarker.setIcon(L.divIcon({
@@ -534,7 +543,6 @@ function updateMapPosition(s) {
     iconSize: [16,16], iconAnchor: [8,8],
   }));
 
-  // popup
   const trip = s.trip;
   let popup = `<b>${VEHICLE_ID}</b><br>${lat.toFixed(5)}, ${lon.toFixed(5)}`;
   if (trip && trip.trip_id) {
@@ -565,21 +573,16 @@ message Position { required float latitude = 1; required float longitude = 2; op
 message TripDescriptor { optional string trip_id = 1; optional string route_id = 5; }
 message VehicleDescriptor { optional string id = 1; optional string label = 2; }
 `;
-  try {
-    feedProtoRoot = protobuf.parse(protoContent).root;
-  } catch(e) {
-    console.error("Proto parse error:", e);
-  }
+  try { feedProtoRoot = protobuf.parse(protoContent).root; }
+  catch(e) { console.error("Proto parse error:", e); }
 }
 
 async function pollFeed() {
   if (!feedProtoRoot) return;
   const FeedMessage = feedProtoRoot.lookupType("transit_realtime.FeedMessage");
-
   try {
     const resp = await fetch(GTFS_RT_URL);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-
     const buf = await resp.arrayBuffer();
     const msg = FeedMessage.decode(new Uint8Array(buf));
 
@@ -588,24 +591,16 @@ async function pollFeed() {
     document.getElementById("feedSize").textContent = `${buf.byteLength} bytes`;
 
     const ts = msg.header?.timestamp;
-    if (ts) {
-      const d = new Date(Number(ts) * 1000);
-      document.getElementById("feedTimestamp").textContent = d.toLocaleTimeString("ja-JP");
-    }
+    if (ts) document.getElementById("feedTimestamp").textContent = new Date(Number(ts) * 1000).toLocaleTimeString("ja-JP");
 
     const entities = msg.entity || [];
     document.getElementById("feedEntities").textContent = entities.length;
-
     let vpCount = 0, tuCount = 0;
-    for (const e of entities) {
-      if (e.vehicle) vpCount++;
-      if (e.tripUpdate) tuCount++;
-    }
+    for (const e of entities) { if (e.vehicle) vpCount++; if (e.tripUpdate) tuCount++; }
     document.getElementById("feedVP").textContent = vpCount;
     const tuEl = document.getElementById("feedTU");
     tuEl.textContent = tuCount;
     tuEl.style.color = tuCount > 0 ? "var(--ok)" : "var(--muted)";
-
   } catch(e) {
     console.error("GTFS-RT fetch/decode error:", e);
     document.getElementById("feedDot").style.background = "var(--err)";
@@ -619,30 +614,23 @@ async function pollFeed() {
 }
 
 // ============================================================
-// Clock
+// Clock & Init
 // ============================================================
 function updateClock() {
-  const now = new Date();
   document.getElementById("clockLabel").textContent =
-    now.toLocaleTimeString("ja-JP", { timeZone: "Asia/Tokyo", hour12: false });
+    new Date().toLocaleTimeString("ja-JP", { timeZone: "Asia/Tokyo", hour12: false });
 }
 
-// ============================================================
-// INIT & Visibility (省エネ対応)
-// ============================================================
 let feedInterval = null;
-
 function startApp() {
   if (!unsubLatest && !unsubLogs) startListeners();
   pollFeed();
   feedInterval = setInterval(pollFeed, FEED_POLL_MS);
 }
-
 function stopApp() {
   if (unsubLatest) { unsubLatest(); unsubLatest = null; }
   if (unsubLogs) { unsubLogs(); unsubLogs = null; }
   if (feedInterval) { clearInterval(feedInterval); feedInterval = null; }
-
   document.getElementById("connDot").classList.replace("on", "off");
   document.getElementById("connLabel").textContent = "スリープ中 (タブ非表示)";
 }
@@ -650,24 +638,15 @@ function stopApp() {
 document.addEventListener("DOMContentLoaded", () => {
   initMap();
   initFirebase();
-  initProto().then(() => {
-    startApp();
-  });
-
+  initProto().then(() => startApp());
   updateClock();
   setInterval(updateClock, 1000);
-
-  // refresh freshness counter
-  setInterval(() => {
-    if (lastState) updateGpsPanel(lastState);
-  }, 1000);
+  setInterval(() => { if (lastState) updateGpsPanel(lastState); }, 1000);
 });
 
-// タブの表示/非表示が切り替わった時の処理
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) {
-    stopApp();
-  } else {
+  if (document.hidden) { stopApp(); }
+  else {
     document.getElementById("connDot").classList.replace("off", "on");
     document.getElementById("connLabel").textContent = "Firestore 接続済";
     startApp();
@@ -676,7 +655,6 @@ document.addEventListener("visibilitychange", () => {
 </script>
 
 <style>
-/* Leaflet tooltip override */
 .stop-tooltip {
   background: rgba(15,23,42,.9) !important;
   color: #e2e8f0 !important;
@@ -688,6 +666,5 @@ document.addEventListener("visibilitychange", () => {
 }
 .stop-tooltip::before { border-top-color: rgba(15,23,42,.9) !important; }
 </style>
-
 </body>
 </html>
