@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>瑞穂バスロケ ― 管理ダッシュボード</title>
+<title>瑞穂バスロケ — 管理ダッシュボード</title>
 
 <!-- Leaflet -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
@@ -84,6 +84,9 @@
   .tag-ng { background:rgba(248,113,113,.15); color:var(--err); }
   .tag-trip { background:rgba(56,189,248,.15); color:var(--accent); }
 
+  /* debug separator */
+  .kv-sep { grid-column: 1 / -1; border-top:1px dashed var(--border); margin:4px 0; }
+
   /* responsive */
   @media (max-width:900px) {
     .main { flex-direction:column; }
@@ -157,6 +160,17 @@
         <dt>distance_error</dt><dd id="tripDistError">--</dd>
         <dt>offset (横ずれ)</dt><dd id="tripOffset">--</dd>
         <dt>score</dt><dd id="tripScore">--</dd>
+
+        <!-- debug section -->
+        <div class="kv-sep"></div>
+        <dt>debug_reason</dt><dd id="tripDebugReason">--</dd>
+        <dt>candidate_count</dt><dd id="tripCandidateCount">--</dd>
+        <dt>best_trip</dt><dd id="tripBestTrip">--</dd>
+        <dt>best_route</dt><dd id="tripBestRoute">--</dd>
+        <dt>best_shape</dt><dd id="tripBestShape">--</dd>
+        <dt>best_offset</dt><dd id="tripBestOffset">--</dd>
+        <dt>best_error</dt><dd id="tripBestError">--</dd>
+        <dt>best_reject</dt><dd id="tripBestReject">--</dd>
       </dl>
       <div style="margin-top:8px;">
         <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">ルート進捗</div>
@@ -199,7 +213,7 @@
 
 <script>
 // ============================================================
-// CONFIG — ★ ここにFirebase設定を入れてください
+// CONFIG — ☆ ここにFirebase設定を入れてください
 // ============================================================
 const FIREBASE_CONFIG = {
   apiKey:            "YOUR_API_KEY",
@@ -261,10 +275,10 @@ function startListeners() {
     document.getElementById("connLabel").textContent = "リスナーエラー";
   });
 
-  // gps_logs (latest 30)
+  // gps_logs (latest 10)
   unsubLogs = db.collection("gps_logs")
     .orderBy("timestamp_unix", "desc")
-    .limit(30)
+    .limit(10)
     .onSnapshot(snap => {
       const logs = [];
       snap.forEach(doc => logs.push(doc.data()));
@@ -295,11 +309,25 @@ function updateGpsPanel(s) {
 }
 
 // ============================================================
-// UI: Trip Panel
+// UI: Trip Panel (with debug)
 // ============================================================
 function updateTripPanel(s) {
   const t = s.trip;
+  const dbg = s.trip_debug || {};
+  const best = dbg.top_candidate || {};
+
+  // --- debug fields (always update) ---
+  const debugReasonEl = document.getElementById("tripDebugReason");
+  const candidateCountEl = document.getElementById("tripCandidateCount");
+  const bestTripEl = document.getElementById("tripBestTrip");
+  const bestRouteEl = document.getElementById("tripBestRoute");
+  const bestShapeEl = document.getElementById("tripBestShape");
+  const bestOffsetEl = document.getElementById("tripBestOffset");
+  const bestErrorEl = document.getElementById("tripBestError");
+  const bestRejectEl = document.getElementById("tripBestReject");
+
   if (!t || !t.trip_id) {
+    // --- trip なし ---
     document.getElementById("tripId").textContent = "--";
     document.getElementById("tripRoute").textContent = "--";
     document.getElementById("tripStatus").textContent = "--";
@@ -309,14 +337,36 @@ function updateTripPanel(s) {
     document.getElementById("tripDistError").textContent = "--";
     document.getElementById("tripOffset").textContent = "--";
     document.getElementById("tripScore").textContent = "--";
+
+    debugReasonEl.textContent = dbg.reason || "--";
+    debugReasonEl.style.color = dbg.reason ? "var(--err)" : "var(--muted)";
+    candidateCountEl.textContent =
+      dbg.candidate_trip_count != null ? String(dbg.candidate_trip_count) : "--";
+
+    bestTripEl.textContent = best.trip_id || "--";
+    bestRouteEl.textContent = best.route_id || "--";
+    bestShapeEl.textContent = best.shape_id || "--";
+    bestOffsetEl.textContent =
+      best.projection_offset_m != null ? `${Number(best.projection_offset_m).toFixed(1)} m` : "--";
+    bestOffsetEl.style.color =
+      best.projection_offset_m != null && best.projection_offset_m > 250 ? "var(--err)" : "var(--muted)";
+    bestErrorEl.textContent =
+      best.distance_error_m != null ? `${Number(best.distance_error_m).toFixed(1)} m` : "--";
+    bestErrorEl.style.color =
+      best.distance_error_m != null && best.distance_error_m > 1000 ? "var(--err)" : "var(--muted)";
+    bestRejectEl.textContent = best.reject_reason || "--";
+    bestRejectEl.style.color = best.reject_reason ? "var(--err)" : "var(--muted)";
+
     document.getElementById("delayValue").textContent = "--";
-    document.getElementById("delayLabel").textContent = "便マッチなし";
+    document.getElementById("delayLabel").textContent =
+      dbg.reason ? `便マッチなし: ${dbg.reason}` : "便マッチなし";
     document.getElementById("delayValue").style.color = "var(--muted)";
     document.getElementById("progressFill").style.width = "0%";
     document.getElementById("progressPct").textContent = "--%";
     return;
   }
 
+  // --- trip あり ---
   document.getElementById("tripId").textContent = t.trip_id;
   document.getElementById("tripRoute").innerHTML =
     `<span style="color:${ROUTE_COLORS[t.route_id]||'#fff'}">${t.route_name || t.route_id}</span>`;
@@ -331,26 +381,44 @@ function updateTripPanel(s) {
   const err = t.distance_error_m;
   const errEl = document.getElementById("tripDistError");
   errEl.textContent = err != null ? `${Number(err).toFixed(0)} m` : "--";
-  if (err != null) errEl.style.color = err < 200 ? "var(--ok)" : err < 500 ? "var(--warn)" : "var(--err)";
+  if (err != null) {
+    errEl.style.color = err < 200 ? "var(--ok)" : err < 500 ? "var(--warn)" : "var(--err)";
+  }
 
   document.getElementById("tripOffset").textContent =
     t.projection_offset_m != null ? `${Number(t.projection_offset_m).toFixed(1)} m` : "--";
   document.getElementById("tripScore").textContent =
     t.score != null ? Number(t.score).toFixed(1) : "--";
 
+  // debug (trip ありの場合)
+  debugReasonEl.textContent = "matched ✓";
+  debugReasonEl.style.color = "var(--ok)";
+  candidateCountEl.textContent =
+    dbg.candidate_trip_count != null ? String(dbg.candidate_trip_count) : "--";
+  bestTripEl.textContent = t.trip_id;
+  bestRouteEl.textContent = t.route_id;
+  bestShapeEl.textContent = t.shape_id || "--";
+  bestOffsetEl.textContent =
+    t.projection_offset_m != null ? `${Number(t.projection_offset_m).toFixed(1)} m` : "--";
+  bestOffsetEl.style.color = "var(--ok)";
+  bestErrorEl.textContent =
+    t.distance_error_m != null ? `${Number(t.distance_error_m).toFixed(1)} m` : "--";
+  bestErrorEl.style.color = "var(--ok)";
+  bestRejectEl.textContent = "none (matched)";
+  bestRejectEl.style.color = "var(--ok)";
+
   // delay
   const delaySec = t.delay_sec || 0;
   const delayMin = (delaySec / 60).toFixed(1);
   const dvEl = document.getElementById("delayValue");
   dvEl.textContent = (delaySec >= 0 ? "+" : "") + delayMin;
-  dvEl.style.color = Math.abs(delaySec) < 60 ? "var(--ok)" : Math.abs(delaySec) < 180 ? "var(--warn)" : "var(--err)";
+  dvEl.style.color =
+    Math.abs(delaySec) < 60 ? "var(--ok)" :
+    Math.abs(delaySec) < 180 ? "var(--warn)" : "var(--err)";
   document.getElementById("delayLabel").textContent =
     delaySec > 60 ? "遅延" : delaySec < -60 ? "早着" : "定時";
 
   // progress
-  // We need route length — rough: use expected_distance_m of last stop or shape total
-  // For now use a heuristic: the trip_progress endpoint isn't directly available
-  // Use current_distance_m vs some max
   const maxDist = Math.max(t.current_distance_m || 0, t.expected_distance_m || 0, 1) * 1.3 + 500;
   const curPct = Math.min(100, Math.max(0, (t.current_distance_m || 0) / maxDist * 100));
   const expPct = Math.min(100, Math.max(0, (t.expected_distance_m || 0) / maxDist * 100));
@@ -365,7 +433,6 @@ function updateTripPanel(s) {
 // ============================================================
 function updateLogPanel(logs) {
   const el = document.getElementById("logScroll");
-  // logs are newest-first
   const html = logs.map(l => {
     const t = l.server_received_at ? l.server_received_at.split("T")[1]?.split("+")[0]?.substring(0,8) : "--";
     const acc = l.accepted;
@@ -374,6 +441,8 @@ function updateLogPanel(logs) {
     if (l.trip_match) {
       const tm = l.trip_match;
       tripTag = `<span class="log-tag tag-trip">${tm.trip_id} Δ${tm.distance_error_m?.toFixed?.(0)||"?"}m</span>`;
+    } else if (l.trip_debug && l.trip_debug.reason) {
+      tripTag = `<span class="log-tag tag-ng" style="font-size:9px;">${l.trip_debug.reason}</span>`;
     }
     const body = `lat=${Number(l.lat||0).toFixed(5)} lon=${Number(l.lon||0).toFixed(5)} acc=${l.accuracy||"?"}`;
     return `<div class="log-entry"><span class="log-time">${t}</span>${tag}${tripTag}<span class="log-body">${body}</span></div>`;
@@ -470,7 +539,7 @@ function updateMapPosition(s) {
   let popup = `<b>${VEHICLE_ID}</b><br>${lat.toFixed(5)}, ${lon.toFixed(5)}`;
   if (trip && trip.trip_id) {
     const dm = (trip.delay_sec / 60).toFixed(1);
-    popup += `<br>便: ${trip.trip_id}<br>遅延: ${dm}分<br>停留所: ${trip.nearest_stop_name || ""}`;
+    popup += `<br>便: ${trip.trip_id}<br>遅延: ${dm}分<br>最寄停: ${trip.nearest_stop_name || ""}`;
   }
   busMarker.bindPopup(popup);
 }
@@ -481,7 +550,6 @@ function updateMapPosition(s) {
 let feedProtoRoot = null;
 
 async function initProto() {
-  // Build GTFS-RT proto inline
   const protoContent = `
 syntax = "proto2";
 package transit_realtime;
@@ -539,8 +607,14 @@ async function pollFeed() {
     tuEl.style.color = tuCount > 0 ? "var(--ok)" : "var(--muted)";
 
   } catch(e) {
+    console.error("GTFS-RT fetch/decode error:", e);
     document.getElementById("feedDot").style.background = "var(--err)";
     document.getElementById("feedStatus").textContent = `エラー: ${e.message}`;
+    document.getElementById("feedSize").textContent = "--";
+    document.getElementById("feedTimestamp").textContent = "--";
+    document.getElementById("feedEntities").textContent = "--";
+    document.getElementById("feedVP").textContent = "--";
+    document.getElementById("feedTU").textContent = "--";
   }
 }
 
@@ -554,15 +628,32 @@ function updateClock() {
 }
 
 // ============================================================
-// INIT
+// INIT & Visibility (省エネ対応)
 // ============================================================
+let feedInterval = null;
+
+function startApp() {
+  if (!unsubLatest && !unsubLogs) startListeners();
+  pollFeed();
+  feedInterval = setInterval(pollFeed, FEED_POLL_MS);
+}
+
+function stopApp() {
+  if (unsubLatest) { unsubLatest(); unsubLatest = null; }
+  if (unsubLogs) { unsubLogs(); unsubLogs = null; }
+  if (feedInterval) { clearInterval(feedInterval); feedInterval = null; }
+
+  document.getElementById("connDot").classList.replace("on", "off");
+  document.getElementById("connLabel").textContent = "スリープ中 (タブ非表示)";
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   initMap();
-  initProto().then(() => {
-    pollFeed();
-    setInterval(pollFeed, FEED_POLL_MS);
-  });
   initFirebase();
+  initProto().then(() => {
+    startApp();
+  });
+
   updateClock();
   setInterval(updateClock, 1000);
 
@@ -570,6 +661,17 @@ document.addEventListener("DOMContentLoaded", () => {
   setInterval(() => {
     if (lastState) updateGpsPanel(lastState);
   }, 1000);
+});
+
+// タブの表示/非表示が切り替わった時の処理
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    stopApp();
+  } else {
+    document.getElementById("connDot").classList.replace("off", "on");
+    document.getElementById("connLabel").textContent = "Firestore 接続済";
+    startApp();
+  }
 });
 </script>
 

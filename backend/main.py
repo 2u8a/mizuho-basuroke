@@ -196,6 +196,17 @@ def _latlon_to_xy(lat, lon, ref_lat, ref_lon):
     return x, y
 
 
+def _cors_headers(content_type="application/json; charset=utf-8"):
+    """CORS ヘッダを返す。admin.html → Cloud Functions 間で必要。"""
+    return {
+        "Content-Type": content_type,
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-API-KEY",
+        "Access-Control-Max-Age": "3600",
+    }
+
+
 # ============================================================
 # ランタイム shape投影
 # ============================================================
@@ -401,6 +412,134 @@ def match_trip(lat, lon, now_dt, prev_state=None):
 
 
 # ============================================================
+# 便推定失敗時の詳細デバッグ
+# ============================================================
+def explain_trip_match_failure(lat, lon, now_dt, prev_state=None):
+    """match_trip() が None を返した理由を候補便ごとに詳細に返す。"""
+    _ensure_init()
+
+    candidates = _candidate_trips(now_dt)
+    now_sec = _seconds_since_midnight(now_dt)
+    slat, slon = _smooth_position(lat, lon, prev_state, now_dt)
+
+    pt = (prev_state or {}).get("trip") or {}
+    ptid = pt.get("trip_id")
+    pdist = pt.get("current_distance_m")
+    pts = (prev_state or {}).get("timestamp_unix")
+    fresh = pts is not None and 0 <= (int(now_dt.timestamp()) - int(pts)) <= 180
+
+    rows = []
+
+    for tid in candidates:
+        row = {
+            "trip_id": tid,
+            "route_id": TRIPS[tid]["route_id"],
+            "shape_id": TRIPS[tid]["shape_id"],
+        }
+
+        exp_d = time_to_distance(tid, now_sec)
+        row["expected_distance_m"] = round(exp_d, 1)
+
+        anchor = (exp_d + float(pdist)) / 2.0 if (fresh and ptid == tid and pdist is not None) else exp_d
+        proj = _project_to_trip_distance(tid, slat, slon, anchor_distance_m=anchor)
+
+        if proj is None:
+            row["reject_reason"] = "projection_failed"
+            row["projection_offset_m"] = None
+            row["distance_error_m"] = None
+            row["current_distance_m"] = None
+            row["score"] = None
+            rows.append(row)
+            continue
+
+        cur_d = proj["distance_m"]
+        err = abs(exp_d - cur_d)
+
+        row["current_distance_m"] = round(cur_d, 1)
+        row["distance_error_m"] = round(err, 1)
+        row["projection_offset_m"] = round(proj["offset_m"], 1)
+
+        if proj["offset_m"] > MAX_SHAPE_OFFSET_M:
+            row["reject_reason"] = f"offset_too_large (>{MAX_SHAPE_OFFSET_M}m)"
+            row["score"] = None
+            rows.append(row)
+            continue
+
+        dfp = None
+        penalty = 0.0
+        if fresh and pdist is not None:
+            try:
+                dfp = cur_d - float(pdist)
+            except Exception:
+                pass
+
+        if ptid == tid and dfp is not None:
+            row["delta_from_prev_m"] = round(dfp, 1)
+
+            if abs(dfp) > MAX_JUMP_DISTANCE_M:
+                row["reject_reason"] = f"jump_too_large (>{MAX_JUMP_DISTANCE_M}m)"
+                row["score"] = None
+                rows.append(row)
+                continue
+
+            if dfp < -REVERSE_REJECT_M:
+                row["reject_reason"] = f"reverse_too_large (<-{REVERSE_REJECT_M}m)"
+                row["score"] = None
+                rows.append(row)
+                continue
+
+            penalty = 250.0 if dfp < -20 else -80.0
+
+        elif ptid and ptid in candidates:
+            penalty = 120.0
+
+        score = err + penalty
+        row["score"] = round(score, 1)
+
+        ns = _nearest_progress_stop(tid, cur_d)
+        if not ns:
+            row["reject_reason"] = "no_progress_stop"
+            rows.append(row)
+            continue
+
+        if err > MAX_MATCH_ERROR_M:
+            row["reject_reason"] = f"distance_error_too_large (>{MAX_MATCH_ERROR_M}m)"
+            rows.append(row)
+            continue
+
+        row["reject_reason"] = None  # マッチ可能
+        rows.append(row)
+
+    # offset の小さい順 → error の小さい順にソート
+    def _sort_key(x):
+        return (
+            0 if x.get("reject_reason") is None else 1,
+            x.get("projection_offset_m") if x.get("projection_offset_m") is not None else 999999,
+            x.get("distance_error_m") if x.get("distance_error_m") is not None else 999999,
+            x.get("score") if x.get("score") is not None else 999999,
+        )
+
+    rows.sort(key=_sort_key)
+    top = rows[0] if rows else None
+
+    summary_reason = None
+    if not rows:
+        summary_reason = "no_candidate_trips"
+    elif top and top.get("reject_reason") is None:
+        summary_reason = None
+    elif top:
+        summary_reason = top.get("reject_reason")
+    else:
+        summary_reason = "unknown"
+
+    return {
+        "summary_reason": summary_reason,
+        "top_candidate": top,
+        "candidates": rows[:5],
+    }
+
+
+# ============================================================
 # stop_time_update
 # ============================================================
 def build_stop_time_updates(trip_id, delay_sec, current_distance_m=None, now_sec=None):
@@ -479,24 +618,31 @@ def _validate_gps(data):
 
 
 # ============================================================
-# Cloud Functions (モジュールレベルに重い処理なし)
+# Cloud Functions
 # ============================================================
 @https_fn.on_request()
 def gps(req):
     _ensure_init()
 
-    if req.headers.get("X-API-KEY") != API_KEY:
-        return ("Unauthorized", 401)
+    # --- CORS preflight ---
+    if req.method == "OPTIONS":
+        return ("", 204, _cors_headers("text/plain; charset=utf-8"))
+
     if req.method != "POST":
-        return ("Method Not Allowed", 405)
+        return ("Method Not Allowed", 405, _cors_headers("text/plain; charset=utf-8"))
+
+    if req.headers.get("X-API-KEY") != API_KEY:
+        return ("Unauthorized", 401, _cors_headers("text/plain; charset=utf-8"))
+
     try:
         data = req.get_json(force=True)
     except Exception:
-        return ({"ok": False, "error": "invalid_json"}, 400)
+        return ({"ok": False, "error": "invalid_json"}, 400, _cors_headers())
 
     now = _now_jst()
     ts_unix = int(now.timestamp())
     srv_at = now.isoformat()
+
     accepted, reason = _validate_gps(data)
     vid = data.get("vehicle_id", VEHICLE_ID)
     lat, lon = data.get("lat"), data.get("lon")
@@ -505,66 +651,153 @@ def gps(req):
     snap = latest_ref.get()
     prev = snap.to_dict() if snap.exists else None
 
+    # --- 便推定 + デバッグ ---
+    active_service_ids = []
+    candidate_trips = []
     tm = None
+    no_match_reason = None
+    fail_debug = None
+
     if accepted:
         try:
+            active_service_ids = resolve_active_service_ids(now)
+            candidate_trips = _candidate_trips(now)
+
+            if not active_service_ids:
+                no_match_reason = "no_active_service_ids"
+            elif not candidate_trips:
+                no_match_reason = "no_candidate_trips_for_current_time"
+
             tm = match_trip(float(lat), float(lon), now, prev_state=prev)
+
+            if tm is None:
+                fail_debug = explain_trip_match_failure(
+                    float(lat), float(lon), now, prev_state=prev
+                )
+                if no_match_reason is None:
+                    no_match_reason = (
+                        fail_debug.get("summary_reason")
+                        or "candidate_exists_but_shape_match_failed"
+                    )
+
         except Exception as e:
             logger.error("Trip match error: %s", e, exc_info=True)
+            no_match_reason = "trip_match_exception"
 
-    log_doc = {
-        "vehicle_id": vid, "lat": float(lat) if lat else None, "lon": float(lon) if lon else None,
-        "accuracy": data.get("accuracy"), "speed": data.get("speed"), "heading": data.get("heading"),
-        "timestamp": data.get("timestamp"), "timestamp_unix": ts_unix,
-        "server_received_at": srv_at, "accepted": accepted, "reject_reason": reason, "raw": data,
+    # --- trip_debug (Firestore + レスポンスに含める) ---
+    trip_debug = {
+        "service_date": now.strftime("%Y-%m-%d"),
+        "service_time_jst": now.strftime("%H:%M:%S"),
+        "accepted": accepted,
+        "gps_reject_reason": reason if not accepted else None,
+        "active_service_count": len(active_service_ids),
+        "active_service_ids": active_service_ids[:10],
+        "candidate_trip_count": len(candidate_trips),
+        "candidate_trip_ids_sample": candidate_trips[:10],
+        "matched": bool(tm),
+        "reason": None if tm else no_match_reason,
+        "top_candidate": fail_debug.get("top_candidate") if fail_debug else None,
+        "candidates": fail_debug.get("candidates", []) if fail_debug else [],
     }
+
+    # --- gps_logs ---
+    log_doc = {
+        "vehicle_id": vid,
+        "lat": float(lat) if lat is not None else None,
+        "lon": float(lon) if lon is not None else None,
+        "accuracy": data.get("accuracy"),
+        "speed": data.get("speed"),
+        "heading": data.get("heading"),
+        "timestamp": data.get("timestamp"),
+        "timestamp_unix": ts_unix,
+        "server_received_at": srv_at,
+        "accepted": accepted,
+        "reject_reason": reason,
+        "raw": data,
+        "trip_debug": trip_debug,
+    }
+
     if tm:
-        log_doc["trip_match"] = {k: tm[k] for k in
-            ["trip_id", "route_id", "shape_id", "current_distance_m", "expected_distance_m",
-             "distance_error_m", "projection_offset_m", "delay_sec", "current_stop_sequence",
-             "nearest_stop_id", "score", "delta_from_prev_m"]}
+        log_doc["trip_match"] = {
+            k: tm[k] for k in [
+                "trip_id", "route_id", "shape_id", "current_distance_m", "expected_distance_m",
+                "distance_error_m", "projection_offset_m", "delay_sec", "current_stop_sequence",
+                "nearest_stop_id", "score", "delta_from_prev_m"
+            ]
+        }
+
     db.collection("gps_logs").add(log_doc)
 
+    # --- latest state ---
     if accepted:
         latest = {
-            "vehicle_id": vid, "lat": float(lat), "lon": float(lon),
-            "accuracy": data.get("accuracy"), "speed": data.get("speed"), "heading": data.get("heading"),
-            "timestamp": data.get("timestamp"), "timestamp_unix": ts_unix,
-            "server_received_at": srv_at, "updated_at": _firestore_mod.SERVER_TIMESTAMP,
+            "vehicle_id": vid,
+            "lat": float(lat),
+            "lon": float(lon),
+            "accuracy": data.get("accuracy"),
+            "speed": data.get("speed"),
+            "heading": data.get("heading"),
+            "timestamp": data.get("timestamp"),
+            "timestamp_unix": ts_unix,
+            "server_received_at": srv_at,
+            "updated_at": _firestore_mod.SERVER_TIMESTAMP,
             "trip": None,
+            "trip_debug": trip_debug,
         }
+
         if tm:
-            latest["trip"] = {k: tm[k] for k in
-                ["trip_id", "route_id", "route_name", "shape_id",
-                 "current_distance_m", "expected_distance_m", "distance_error_m", "projection_offset_m",
-                 "expected_time_sec", "delay_sec", "nearest_stop_id", "nearest_stop_name",
-                 "current_stop_sequence", "vehicle_stop_status", "score", "delta_from_prev_m"]}
+            latest["trip"] = {
+                k: tm[k] for k in [
+                    "trip_id", "route_id", "route_name", "shape_id",
+                    "current_distance_m", "expected_distance_m", "distance_error_m", "projection_offset_m",
+                    "expected_time_sec", "delay_sec", "nearest_stop_id", "nearest_stop_name",
+                    "current_stop_sequence", "vehicle_stop_status", "score", "delta_from_prev_m"
+                ]
+            }
+
         latest_ref.set(latest)
 
-    resp = {"ok": True, "accepted": accepted}
+    # --- レスポンス ---
+    resp = {
+        "ok": True,
+        "accepted": accepted,
+        "trip_debug": trip_debug,
+    }
+
     if tm:
         resp["trip"] = {
-            "trip_id": tm["trip_id"], "route_id": tm["route_id"], "route_name": tm["route_name"],
-            "delay_min": round(tm["delay_sec"] / 60.0, 1), "nearest_stop": tm["nearest_stop_name"],
+            "trip_id": tm["trip_id"],
+            "route_id": tm["route_id"],
+            "route_name": tm["route_name"],
+            "delay_min": round(tm["delay_sec"] / 60.0, 1),
+            "nearest_stop": tm["nearest_stop_name"],
             "status": tm["vehicle_stop_status"],
-            "current_distance_m": tm["current_distance_m"], "distance_error_m": tm["distance_error_m"],
+            "current_distance_m": tm["current_distance_m"],
+            "distance_error_m": tm["distance_error_m"],
         }
+
     if not accepted:
         resp["reject_reason"] = reason
-    return (resp, 200)
+
+    return (resp, 200, _cors_headers())
 
 
 @https_fn.on_request()
 def gtfs_rt(req):
     _ensure_init()
 
+    # --- CORS preflight ---
+    if req.method == "OPTIONS":
+        return ("", 204, _cors_headers("text/plain; charset=utf-8"))
+
     doc = db.document(f"vehicles/{VEHICLE_ID}/state/latest").get()
+
     if not doc.exists:
         feed = gtfs_realtime_pb2.FeedMessage()
         feed.header.gtfs_realtime_version = "2.0"
         feed.header.incrementality = gtfs_realtime_pb2.FeedHeader.FULL_DATASET
         feed.header.timestamp = int(time.time())
-        return (feed.SerializeToString(), 200, {"Content-Type": "application/x-protobuf"})
+        return (feed.SerializeToString(), 200, _cors_headers("application/x-protobuf"))
 
     state = doc.to_dict()
     ti = state.get("trip")
@@ -573,13 +806,21 @@ def gtfs_rt(req):
     if tm is None and state.get("lat") is not None:
         try:
             ts = int(state.get("timestamp_unix", int(time.time())))
-            tm = match_trip(float(state["lat"]), float(state["lon"]),
-                            datetime.fromtimestamp(ts, tz=JST), prev_state=state)
+            tm = match_trip(
+                float(state["lat"]),
+                float(state["lon"]),
+                datetime.fromtimestamp(ts, tz=JST),
+                prev_state=state,
+            )
         except Exception as e:
             logger.error("gtfs_rt fallback: %s", e, exc_info=True)
 
     pb = build_gtfs_rt_feed(
-        float(state.get("lat", 0.0)), float(state.get("lon", 0.0)),
-        int(state.get("timestamp_unix", int(time.time()))), tm, VEHICLE_ID,
+        float(state.get("lat", 0.0)),
+        float(state.get("lon", 0.0)),
+        int(state.get("timestamp_unix", int(time.time()))),
+        tm,
+        VEHICLE_ID,
     )
-    return (pb, 200, {"Content-Type": "application/x-protobuf"})
+
+    return (pb, 200, _cors_headers("application/x-protobuf"))
