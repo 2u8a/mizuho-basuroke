@@ -1,20 +1,26 @@
 """
-Module B – GPS受信 / route推定 / shapeベース便推定 / 遅延判定 / GTFS-RT生成 / Firestore包括保存
+Module B – GPS受信 / 5状態ステートマシン / 便固定 / 遅延追跡 / GTFS-RT生成 / Firestore保存
 
-瑞穂町コミュニティバス バスロケーションシステム PoC
+瑞穂町コミュニティバス バスロケーションシステム PoC （便固定モデル v3）
 
-この版で行うこと:
-- GPS受信
-- route候補推定（shape幾何のみ）
-- trip候補推定（時刻+shape+継続性+route lock）
-- 遅延推定
-- Firestoreへ包括保存
-  - gps_logs
-  - vehicles/{vehicle_id}/state/latest
-  - vehicles/{vehicle_id}/events/{event_id}
-  - vehicles/{vehicle_id}/events/{event_id}/candidates/{candidate_id}
-  - vehicles/{vehicle_id}/gtfs_rt_audit/{snapshot_id}
-- GTFS-Realtime生成
+設計方針:
+  - 毎GPS再推定ではなく、起動→車庫→始発→候補絞込→便固定→遅延追跡 の状態機械
+  - 一度便を固定したら原則として便を変更しない
+  - 平滑化は TRIP_LOCKED 中のみ
+  - GTFS-RT は latest の確定状態だけを反映（再推定フォールバック廃止）
+
+状態遷移:
+  IDLE
+    ↓ 最初の accepted GPS
+  PRE_SERVICE_MOVE          車庫→駅などの回送中。便候補は作らない
+    ↓ 始発停留所ジオフェンス内に入る
+  ORIGIN_WAITING            始発で待機。出発時刻窓に入るまで便は確定させない
+    ↓ 出発時刻窓に入る + 候補便≥1
+  CANDIDATE_SEARCH          数回のGPSで候補スコアを累積し、便を確定する
+    ↓ 確定条件成立 / 強制確定
+  TRIP_LOCKED               便固定。以後は遅延だけ追跡
+    ↓ 終点+15分超過 / 30分以上欠損
+  IDLE
 """
 
 # ============================================================
@@ -43,34 +49,46 @@ JST = timezone(timedelta(hours=9))
 VEHICLE_ID = "mizuho-bus-01"
 GTFS_DIR = os.path.join(os.path.dirname(__file__), "data", "gtfs")
 
-# --- matching thresholds ---
-TRIP_TIME_BUFFER_SEC = 600
-MAX_MATCH_ERROR_M = 5000          # 遅延大きめでも便を捨てないよう緩和
-MAX_SHAPE_OFFSET_M = 250
-MAX_JUMP_DISTANCE_M = 1500
-REVERSE_REJECT_M = 150
-STOP_NEAR_GEO_THRESHOLD_M = 70
-SMOOTHING_LOOKBACK_SEC = 30
+ALGORITHM_VERSION = "trip-lock-state-machine-v3"
 
-# --- route lock ---
-SAME_TRIP_BONUS = 180
-SAME_ROUTE_BONUS = 80
-ROUTE_SWITCH_PENALTY = 250
-ROUTE_LOCK_BONUS = 500
-OTHER_ROUTE_PENALTY_WHEN_LOCKED = 800
-LOCK_ESTABLISH_COUNT = 3
-LOCK_RELEASE_NOMATCH_SEC = 300
-
-# --- geo ---
+# --- geo / area ---
 EARTH_RADIUS_M = 6_371_000
 LAT_MIN, LAT_MAX = 35.74, 35.80
 LON_MIN, LON_MAX = 139.32, 139.38
 
-# --- persistence ---
+# --- ジオフェンス（始発停留所判定） ---
+ORIGIN_GEOFENCE_RADIUS_M = 120         # 駅前ロータリー余裕を見て120m
+ORIGIN_LEAVE_HYSTERESIS_M = 60         # ジオフェンスから抜けたとみなす追加距離
+
+# --- 出発時刻窓（始発の予定発車時刻に対して） ---
+DEPARTURE_WINDOW_OPEN_SEC = 15 * 60    # 出発15分前から候補探索開始可
+DEPARTURE_WINDOW_CLOSE_SEC = 10 * 60   # 出発10分後までは候補探索継続可
+
+# --- 候補絞込・確定条件 ---
+CANDIDATE_MIN_GPS_COUNT = 5            # 通常確定の最小GPS受信回数
+CANDIDATE_FORCE_GPS_COUNT = 15         # 強制確定の上限
+CANDIDATE_LOCK_GAP_M = 300.0           # 1位と2位の累積誤差差（m）
+CANDIDATE_MAX_AVG_ERROR_M = 400.0      # 1位の平均距離誤差上限
+MAX_SHAPE_OFFSET_M = 250.0             # shape横ずれ上限（候補棄却用）
+
+# --- TRIP_LOCKED 中の追跡 ---
+SMOOTH_ALPHA = 0.6                     # 直近GPSへの寄せ係数（0.6:0.4 = current:prev）
+LOCKED_REVERSE_REJECT_M = 200.0        # ロック後の逆行棄却（保存はする/採用しない）
+LOCKED_JUMP_REJECT_M = 1500.0          # ジャンプ棄却
+
+# --- IDLE 復帰条件 ---
+LOCKED_END_GRACE_SEC = 15 * 60         # 終着時刻+15分でIDLE復帰
+NO_GPS_IDLE_SEC = 30 * 60              # 30分欠損でIDLE復帰
+PRE_SERVICE_MAX_SEC = 4 * 3600         # 4時間以上 PRE_SERVICE_MOVE 継続したらリセット
+ORIGIN_WAITING_MAX_SEC = 3 * 3600      # 3時間以上 ORIGIN_WAITING 継続したらリセット
+
+# --- nearest stop ---
+STOP_NEAR_GEO_THRESHOLD_M = 70
+
+# --- 永続化 ---
 EVENT_RETENTION_DAYS = 400
 CANDIDATE_STORE_LIMIT = 8
 ENABLE_GTFS_RT_AUDIT = True
-ALGORITHM_VERSION = "route-first-trip-match-full-persistence-v2"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("busroq")
@@ -98,12 +116,16 @@ STOP_TO_SHAPE_DIST = {}
 TRIP_SHAPE_START_ABS = {}
 TRIP_ROUTE_LENGTH = {}
 
-ROUTE_TO_SHAPES = {}
-SHAPE_TO_ROUTES = {}
+# 始発（origin）まわり
+TRIP_ORIGIN_STOP_ID = {}    # trip_id → 最初の stop_id
+TRIP_ORIGIN_DEP_SEC = {}    # trip_id → 最初の departure_sec
+ORIGIN_STOPS = {}           # stop_id → {lat, lon, name}  (origin 集合)
+
 PRECOMPUTED_VERSION = None
 
+
 # ============================================================
-# init
+# init helpers
 # ============================================================
 def _load_csv(filename):
     path = os.path.join(GTFS_DIR, filename)
@@ -139,7 +161,8 @@ def _do_init():
     global STOPS, ROUTES, TRIPS, TRIP_STOP_TIMES, CALENDAR, CALENDAR_DATES
     global SHAPES, SHAPE_TOTAL_DISTANCE, TRIP_PROGRESS
     global STOP_TO_SHAPE_DIST, TRIP_SHAPE_START_ABS, TRIP_ROUTE_LENGTH
-    global ROUTE_TO_SHAPES, SHAPE_TO_ROUTES, PRECOMPUTED_VERSION
+    global TRIP_ORIGIN_STOP_ID, TRIP_ORIGIN_DEP_SEC, ORIGIN_STOPS
+    global PRECOMPUTED_VERSION
 
     if _init_done:
         return
@@ -203,20 +226,26 @@ def _do_init():
     TRIP_SHAPE_START_ABS.update({k: float(v) for k, v in pc["trip_shape_start_abs"].items()})
     TRIP_ROUTE_LENGTH.update({k: float(v) for k, v in pc["trip_route_length"].items()})
 
-    ROUTE_TO_SHAPES.clear()
-    SHAPE_TO_ROUTES.clear()
-    for trip in TRIPS.values():
-        route_id = trip.get("route_id")
-        shape_id = trip.get("shape_id")
-        if not route_id or not shape_id:
+    # --- origin マッピング作成 ---
+    origin_stop_ids = set()
+    for trip_id, stops in TRIP_STOP_TIMES.items():
+        if not stops:
             continue
-        ROUTE_TO_SHAPES.setdefault(route_id, set()).add(shape_id)
-        SHAPE_TO_ROUTES.setdefault(shape_id, set()).add(route_id)
+        first = stops[0]
+        TRIP_ORIGIN_STOP_ID[trip_id] = first["stop_id"]
+        TRIP_ORIGIN_DEP_SEC[trip_id] = int(first["departure_sec"])
+        origin_stop_ids.add(first["stop_id"])
+
+    for sid in origin_stop_ids:
+        s = STOPS.get(sid)
+        if s:
+            ORIGIN_STOPS[sid] = {"lat": s["lat"], "lon": s["lon"], "name": s["name"]}
 
     _init_done = True
     logger.info(
-        "Init complete: stops=%d routes=%d trips=%d shapes=%d precomputed=%s",
-        len(STOPS), len(ROUTES), len(TRIPS), len(SHAPES), PRECOMPUTED_VERSION[:10],
+        "Init complete: stops=%d routes=%d trips=%d shapes=%d origin_stops=%d precomputed=%s",
+        len(STOPS), len(ROUTES), len(TRIPS), len(SHAPES), len(ORIGIN_STOPS),
+        PRECOMPUTED_VERSION[:10],
     )
 
 
@@ -228,16 +257,13 @@ def _ensure_init():
         if not _init_done:
             _do_init()
 
+
 # ============================================================
-# utils
+# generic utils
 # ============================================================
 def _route_name(route_id):
     r = ROUTES.get(route_id, {})
-    return (
-        r.get("route_long_name")
-        or r.get("route_short_name")
-        or route_id
-    )
+    return r.get("route_long_name") or r.get("route_short_name") or route_id
 
 
 def _parse_payload_timestamp(data):
@@ -281,6 +307,7 @@ def _safe_firestore_value(v):
     if isinstance(v, (list, tuple)):
         return [_safe_firestore_value(x) for x in v]
     return v
+
 
 # ============================================================
 # geometry
@@ -329,14 +356,11 @@ def project_to_shape(shape_id, lat, lon):
     for i in range(len(pts) - 1):
         proj = _project_point_to_segment(lat, lon, pts[i], pts[i + 1])
         cand = {**proj, "shape_id": shape_id, "segment_index": i}
-
-        # loop shapeで同程度のoffsetなら、distanceの若い方を優先
         if best is None or cand["offset_m"] < best["offset_m"] - 1.0:
             best = cand
         elif abs(cand["offset_m"] - best["offset_m"]) <= 1.0:
             if cand["distance_m"] < best["distance_m"]:
                 best = cand
-
     return best
 
 
@@ -366,6 +390,7 @@ def _project_to_trip_distance(trip_id, lat, lon, anchor_distance_m=None):
         "distance_m": round(distance_m, 1),
     }
 
+
 # ============================================================
 # trip progress interpolation
 # ============================================================
@@ -377,7 +402,6 @@ def time_to_distance(trip_id, t_sec):
         return float(prog[0]["distance_m"])
     if t_sec >= prog[-1]["time_sec"]:
         return float(prog[-1]["distance_m"])
-
     for i in range(len(prog) - 1):
         p1, p2 = prog[i], prog[i + 1]
         if p1["time_sec"] <= t_sec <= p2["time_sec"]:
@@ -393,12 +417,10 @@ def distance_to_time(trip_id, d_m):
     prog = TRIP_PROGRESS.get(trip_id, [])
     if not prog:
         return 0
-
     if d_m <= prog[0]["distance_m"]:
         return int(prog[0]["time_sec"])
     if d_m >= prog[-1]["distance_m"]:
         return int(prog[-1]["time_sec"])
-
     for i in range(len(prog) - 1):
         p1, p2 = prog[i], prog[i + 1]
         d1 = float(p1["distance_m"])
@@ -411,16 +433,16 @@ def distance_to_time(trip_id, d_m):
             return int(round(p1["time_sec"] + ratio * (p2["time_sec"] - p1["time_sec"])))
     return int(prog[-1]["time_sec"])
 
+
 # ============================================================
-# service / candidates
+# service calendar
 # ============================================================
 def resolve_active_service_ids(now_dt):
     date_str = now_dt.strftime("%Y%m%d")
-    weekday_idx = now_dt.weekday()  # 0=Mon
+    weekday_idx = now_dt.weekday()
     weekday_key = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"][weekday_idx]
 
     active = set()
-
     for sid, row in CALENDAR.items():
         start_date = row.get("start_date", "00000000")
         end_date = row.get("end_date", "99999999")
@@ -429,7 +451,6 @@ def resolve_active_service_ids(now_dt):
         if str(row.get(weekday_key, "0")) == "1":
             active.add(sid)
 
-    # calendar_dates overrides
     for (sid, d), exc_type in CALENDAR_DATES.items():
         if d != date_str:
             continue
@@ -441,36 +462,68 @@ def resolve_active_service_ids(now_dt):
     return sorted(active)
 
 
-def _candidate_trips(now_dt):
+# ============================================================
+# origin geofence
+# ============================================================
+def detect_origin_zone(lat, lon):
+    """
+    現在のGPSが、いずれかの始発停留所ジオフェンスに入っているか判定する。
+    入っているなら (stop_id, distance_m) を返す。複数該当時は最も近いものを返す。
+    """
+    best = None
+    for sid, info in ORIGIN_STOPS.items():
+        d = _haversine(lat, lon, info["lat"], info["lon"])
+        if d <= ORIGIN_GEOFENCE_RADIUS_M:
+            if best is None or d < best[1]:
+                best = (sid, d)
+    return best  # (stop_id, distance_m) or None
+
+
+def is_outside_origin_zone(lat, lon, origin_stop_id):
+    """origin_stop_id のジオフェンスから完全に抜けたか（ヒステリシス込み）"""
+    if not origin_stop_id:
+        return True
+    info = ORIGIN_STOPS.get(origin_stop_id)
+    if not info:
+        return True
+    d = _haversine(lat, lon, info["lat"], info["lon"])
+    return d > (ORIGIN_GEOFENCE_RADIUS_M + ORIGIN_LEAVE_HYSTERESIS_M)
+
+
+# ============================================================
+# departure candidate finder
+# ============================================================
+def find_departure_candidates(origin_stop_id, now_dt, service_ids):
+    """
+    指定 origin_stop_id を始発とし、当日 service_id に属し、
+    出発時刻が now_sec ∈ [-DEPARTURE_WINDOW_OPEN, +DEPARTURE_WINDOW_CLOSE] にある trip を返す。
+    """
+    if not origin_stop_id:
+        return []
     now_sec = _seconds_since_midnight(now_dt)
-    active_service_ids = set(resolve_active_service_ids(now_dt))
     rows = []
-
     for trip_id, trip in TRIPS.items():
-        if trip.get("service_id") not in active_service_ids:
+        if trip.get("service_id") not in service_ids:
             continue
-
-        prog = TRIP_PROGRESS.get(trip_id, [])
-        if not prog:
+        if TRIP_ORIGIN_STOP_ID.get(trip_id) != origin_stop_id:
             continue
-
-        start_sec = int(prog[0]["time_sec"])
-        end_sec = int(prog[-1]["time_sec"])
-        if start_sec - TRIP_TIME_BUFFER_SEC <= now_sec <= end_sec + TRIP_TIME_BUFFER_SEC:
+        dep_sec = TRIP_ORIGIN_DEP_SEC.get(trip_id)
+        if dep_sec is None:
+            continue
+        if (dep_sec - DEPARTURE_WINDOW_OPEN_SEC) <= now_sec <= (dep_sec + DEPARTURE_WINDOW_CLOSE_SEC):
             rows.append({
                 "trip_id": trip_id,
                 "route_id": trip.get("route_id"),
                 "shape_id": trip.get("shape_id"),
                 "service_id": trip.get("service_id"),
-                "start_sec": start_sec,
-                "end_sec": end_sec,
+                "scheduled_departure_sec": dep_sec,
             })
-
-    rows.sort(key=lambda x: (x["start_sec"], x["route_id"], x["trip_id"]))
+    rows.sort(key=lambda x: (x["scheduled_departure_sec"], x["trip_id"]))
     return rows
 
+
 # ============================================================
-# stop / route helpers
+# nearest stop
 # ============================================================
 def _nearest_progress_stop(trip_id, current_distance_m):
     prog = TRIP_PROGRESS.get(trip_id, [])
@@ -488,7 +541,6 @@ def _nearest_progress_stop(trip_id, current_distance_m):
                 "stop_id": p.get("stop_id"),
                 "stop_sequence": p.get("stop_sequence"),
             }
-
     if best is None:
         return None, None, None, None
 
@@ -497,190 +549,129 @@ def _nearest_progress_stop(trip_id, current_distance_m):
     return stop_id, best["stop_sequence"], stop_name, best["distance_m"]
 
 
-def estimate_route_candidates(lat, lon, topn=5):
-    best_by_route = {}
+# ============================================================
+# candidate scoring (CANDIDATE_SEARCH 内)
+# ============================================================
+def evaluate_candidate_once(trip_id, lat, lon, now_dt):
+    """1回のGPSでの候補評価。距離誤差 distance_error_m を返す。"""
+    proj = _project_to_trip_distance(trip_id, lat, lon)
+    if proj is None:
+        return None
 
-    for shape_id in SHAPES.keys():
-        proj = project_to_shape(shape_id, lat, lon)
-        if not proj:
+    if proj["offset_m"] > MAX_SHAPE_OFFSET_M:
+        return {
+            "valid": False,
+            "reason": "offset_too_large",
+            "offset_m": proj["offset_m"],
+        }
+
+    now_sec = _seconds_since_midnight(now_dt)
+    expected_distance_m = float(time_to_distance(trip_id, now_sec))
+    current_distance_m = float(proj["distance_m"])
+    distance_error_m = abs(current_distance_m - expected_distance_m)
+
+    return {
+        "valid": True,
+        "current_distance_m": current_distance_m,
+        "expected_distance_m": expected_distance_m,
+        "distance_error_m": distance_error_m,
+        "offset_m": proj["offset_m"],
+    }
+
+
+def update_candidate_scores(prev_scores, candidates, lat, lon, now_dt):
+    """
+    prev_scores: { trip_id: { score, error_count, gps_count } }
+    candidates: find_departure_candidates の結果
+    """
+    new_scores = {}
+    for c in candidates:
+        tid = c["trip_id"]
+        prev = prev_scores.get(tid) or {"score": 0.0, "error_count": 0, "gps_count": 0}
+        ev = evaluate_candidate_once(tid, lat, lon, now_dt)
+        if ev is None or not ev.get("valid"):
+            new_scores[tid] = {
+                "trip_id": tid,
+                "route_id": c.get("route_id"),
+                "shape_id": c.get("shape_id"),
+                "scheduled_departure_sec": c.get("scheduled_departure_sec"),
+                "score": prev["score"] + 9999.0,        # 投影失敗は重ペナルティ
+                "error_count": prev["error_count"] + 1,
+                "gps_count": prev["gps_count"] + 1,
+                "last_distance_error_m": None,
+                "last_offset_m": ev.get("offset_m") if ev else None,
+                "last_reason": ev.get("reason") if ev else "projection_failed",
+            }
             continue
 
-        route_ids = SHAPE_TO_ROUTES.get(shape_id, set())
-        for route_id in route_ids:
-            row = {
-                "route_id": route_id,
-                "route_name": _route_name(route_id),
-                "shape_id": shape_id,
-                "offset_m": round(proj["offset_m"], 1),
-                "distance_on_shape_m": round(proj["distance_m"], 1),
-                "shape_total_m": round(SHAPE_TOTAL_DISTANCE.get(shape_id, 0.0), 1),
-            }
-            cur = best_by_route.get(route_id)
-            if cur is None or row["offset_m"] < cur["offset_m"]:
-                best_by_route[route_id] = row
-
-    rows = sorted(best_by_route.values(), key=lambda x: (x["offset_m"], x["route_id"]))
-    return rows[:topn]
-
-# ============================================================
-# route lock
-# ============================================================
-def _get_prev_trip(prev_state):
-    if not prev_state:
-        return None
-    trip = prev_state.get("trip")
-    return trip if isinstance(trip, dict) else None
-
-
-def _get_route_lock(prev_state):
-    if not prev_state:
-        return {
-            "locked": False,
-            "route_id": None,
-            "trip_id": None,
-            "consecutive": 0,
-            "lock_since_unix": None,
-            "last_match_unix": None,
-            "last_nomatch_unix": None,
+        new_scores[tid] = {
+            "trip_id": tid,
+            "route_id": c.get("route_id"),
+            "shape_id": c.get("shape_id"),
+            "scheduled_departure_sec": c.get("scheduled_departure_sec"),
+            "score": prev["score"] + ev["distance_error_m"],
+            "error_count": prev["error_count"],
+            "gps_count": prev["gps_count"] + 1,
+            "last_distance_error_m": ev["distance_error_m"],
+            "last_offset_m": ev["offset_m"],
+            "last_reason": "ok",
         }
-    lock = prev_state.get("route_lock") or {}
-    return {
-        "locked": bool(lock.get("locked", False)),
-        "route_id": lock.get("route_id"),
-        "trip_id": lock.get("trip_id"),
-        "consecutive": int(lock.get("consecutive", 0) or 0),
-        "lock_since_unix": lock.get("lock_since_unix"),
-        "last_match_unix": lock.get("last_match_unix"),
-        "last_nomatch_unix": lock.get("last_nomatch_unix"),
-    }
+    return new_scores
 
 
-def _is_trip_ended(trip_id, now_dt):
-    prog = TRIP_PROGRESS.get(trip_id, [])
-    if not prog:
-        return False
-    now_sec = _seconds_since_midnight(now_dt)
-    return now_sec > int(prog[-1]["time_sec"]) + 180
+def decide_trip_lock(scores, gps_count):
+    """確定すべきか判定する。
 
+    return: (locked_trip_id or None, reason_str)
+    """
+    if not scores:
+        return None, "no_candidates"
 
-def _compute_route_lock(prev_state, trip_match, now_dt):
-    now_unix = int(now_dt.timestamp())
-    prev_lock = _get_route_lock(prev_state)
-    prev_trip = _get_prev_trip(prev_state)
+    ranked = sorted(scores.values(), key=lambda x: x["score"])
 
-    if trip_match:
-        same_route = prev_lock.get("route_id") == trip_match.get("route_id")
-        same_trip = prev_lock.get("trip_id") == trip_match.get("trip_id")
+    if gps_count < CANDIDATE_MIN_GPS_COUNT:
+        return None, f"need_more_gps({gps_count}/{CANDIDATE_MIN_GPS_COUNT})"
 
-        if same_route:
-            consecutive = prev_lock.get("consecutive", 0) + 1
-        else:
-            consecutive = 1
+    best = ranked[0]
+    second_score = ranked[1]["score"] if len(ranked) >= 2 else None
+    avg_err = best["score"] / max(1, best["gps_count"])
 
-        locked = prev_lock.get("locked", False)
-        if not locked and consecutive >= LOCK_ESTABLISH_COUNT:
-            locked = True
+    if avg_err > CANDIDATE_MAX_AVG_ERROR_M:
+        if gps_count >= CANDIDATE_FORCE_GPS_COUNT:
+            return best["trip_id"], "forced_lock_low_quality"
+        return None, f"avg_error_too_large({avg_err:.0f}m)"
 
-        lock_since_unix = prev_lock.get("lock_since_unix")
-        if locked and lock_since_unix is None:
-            lock_since_unix = now_unix
+    if second_score is None:
+        return best["trip_id"], "lock_only_candidate"
 
-        return {
-            "locked": locked,
-            "route_id": trip_match.get("route_id"),
-            "trip_id": trip_match.get("trip_id"),
-            "consecutive": consecutive,
-            "lock_since_unix": lock_since_unix,
-            "last_match_unix": now_unix,
-            "last_nomatch_unix": None,
-            "same_trip": same_trip,
-            "state_label": "LOCKED" if locked else "tracking",
-        }
+    gap = second_score - best["score"]
+    if gap >= CANDIDATE_LOCK_GAP_M:
+        return best["trip_id"], "normal_lock"
 
-    # no-match 時
-    if prev_lock.get("locked"):
-        last_match_unix = prev_lock.get("last_match_unix")
-        if last_match_unix and now_unix - int(last_match_unix) <= LOCK_RELEASE_NOMATCH_SEC:
-            keep = dict(prev_lock)
-            keep["last_nomatch_unix"] = now_unix
-            keep["state_label"] = "hold_on_nomatch"
-            return keep
+    if gps_count >= CANDIDATE_FORCE_GPS_COUNT:
+        return best["trip_id"], "forced_lock_close_race"
 
-    if prev_trip and prev_trip.get("trip_id") and not _is_trip_ended(prev_trip["trip_id"], now_dt):
-        # ロック未成立でも直前route/trip情報は温存
-        return {
-            "locked": False,
-            "route_id": prev_trip.get("route_id"),
-            "trip_id": prev_trip.get("trip_id"),
-            "consecutive": 0,
-            "lock_since_unix": None,
-            "last_match_unix": prev_lock.get("last_match_unix"),
-            "last_nomatch_unix": now_unix,
-            "state_label": "recent_context_only",
-        }
+    return None, f"need_more_gap(gap={gap:.0f}m)"
 
-    return {
-        "locked": False,
-        "route_id": None,
-        "trip_id": None,
-        "consecutive": 0,
-        "lock_since_unix": None,
-        "last_match_unix": prev_lock.get("last_match_unix"),
-        "last_nomatch_unix": now_unix,
-        "state_label": "none",
-    }
 
 # ============================================================
-# smoothing
+# locked tracking
 # ============================================================
-def _smooth_position(lat, lon, now_dt, prev_state):
-    if not prev_state:
-        return lat, lon
-
-    prev_ts = prev_state.get("timestamp_unix")
-    if not prev_ts:
-        return lat, lon
-
-    age = int(now_dt.timestamp()) - int(prev_ts)
-    if age < 0 or age > SMOOTHING_LOOKBACK_SEC:
-        return lat, lon
-
-    prev_lat = prev_state.get("lat")
-    prev_lon = prev_state.get("lon")
-    if prev_lat is None or prev_lon is None:
-        return lat, lon
-
-    # 80:20 current-prior smoothing
-    return (0.8 * lat + 0.2 * float(prev_lat), 0.8 * lon + 0.2 * float(prev_lon))
-
-# ============================================================
-# candidate analysis / trip match
-# ============================================================
-def _evaluate_candidate(trip_id, lat, lon, now_dt, prev_state):
-    trip = TRIPS[trip_id]
-    prev_trip = _get_prev_trip(prev_state)
-    route_lock = _get_route_lock(prev_state)
-    now_sec = _seconds_since_midnight(now_dt)
-
-    anchor = None
-    if prev_trip and prev_trip.get("trip_id") == trip_id:
-        anchor = prev_trip.get("current_distance_m")
-    elif route_lock.get("locked") and route_lock.get("route_id") == trip.get("route_id") and prev_trip:
-        anchor = prev_trip.get("current_distance_m")
-
-    proj = _project_to_trip_distance(trip_id, lat, lon, anchor_distance_m=anchor)
+def track_locked_trip(trip_id, lat, lon, now_dt, prev_distance_m=None):
+    """
+    TRIP_LOCKED 中の遅延追跡。
+    prev_distance_m があれば逆行・ジャンプの安全弁を効かせる（accept判定）。
+    """
+    proj = _project_to_trip_distance(trip_id, lat, lon, anchor_distance_m=prev_distance_m)
     if proj is None:
-        return {
-            "trip_id": trip_id,
-            "route_id": trip.get("route_id"),
-            "shape_id": trip.get("shape_id"),
-            "reject_reason": "projection_failed",
-            "score": 999999,
-        }
+        return None
 
     current_distance_m = float(proj["distance_m"])
+    now_sec = _seconds_since_midnight(now_dt)
     expected_distance_m = float(time_to_distance(trip_id, now_sec))
     distance_error_m = abs(current_distance_m - expected_distance_m)
+    expected_time_sec = distance_to_time(trip_id, current_distance_m)
+    delay_sec = int(now_sec - expected_time_sec)
 
     nearest_stop_id, nearest_stop_seq, nearest_stop_name, nearest_stop_dist = _nearest_progress_stop(
         trip_id, current_distance_m
@@ -690,57 +681,16 @@ def _evaluate_candidate(trip_id, lat, lon, now_dt, prev_state):
     if nearest_stop_dist is not None and abs(nearest_stop_dist - current_distance_m) <= STOP_NEAR_GEO_THRESHOLD_M:
         vehicle_stop_status = "STOPPED_AT"
 
-    score = distance_error_m
-    penalties = 0
-    reject_reason = None
     delta_from_prev_m = None
+    rejected_motion = None
+    if prev_distance_m is not None:
+        delta_from_prev_m = round(current_distance_m - float(prev_distance_m), 1)
+        if delta_from_prev_m < -LOCKED_REVERSE_REJECT_M:
+            rejected_motion = f"reverse_too_large({delta_from_prev_m:.0f}m)"
+        elif abs(delta_from_prev_m) > LOCKED_JUMP_REJECT_M:
+            rejected_motion = f"jump_too_large({delta_from_prev_m:.0f}m)"
 
-    # basic reject
-    if proj["offset_m"] > MAX_SHAPE_OFFSET_M:
-        reject_reason = f"offset_too_large (>{MAX_SHAPE_OFFSET_M}m)"
-
-    if distance_error_m > MAX_MATCH_ERROR_M:
-        reject_reason = f"distance_error_too_large (>{MAX_MATCH_ERROR_M}m)"
-
-    # continuity / prev trip
-    if prev_trip and prev_trip.get("trip_id"):
-        prev_dist = prev_trip.get("current_distance_m")
-        prev_route = prev_trip.get("route_id")
-        prev_trip_id = prev_trip.get("trip_id")
-
-        if prev_dist is not None:
-            delta_from_prev_m = round(current_distance_m - float(prev_dist), 1)
-
-        if trip_id == prev_trip_id:
-            penalties -= SAME_TRIP_BONUS
-        elif trip.get("route_id") == prev_route:
-            penalties -= SAME_ROUTE_BONUS
-        else:
-            penalties += ROUTE_SWITCH_PENALTY
-
-        if delta_from_prev_m is not None:
-            if delta_from_prev_m < -REVERSE_REJECT_M:
-                reject_reason = f"reverse_too_large (<-{REVERSE_REJECT_M}m)"
-            elif abs(delta_from_prev_m) > MAX_JUMP_DISTANCE_M and trip_id == prev_trip_id:
-                reject_reason = f"jump_too_large (>{MAX_JUMP_DISTANCE_M}m)"
-
-    # route lock
-    if route_lock.get("locked"):
-        lock_route = route_lock.get("route_id")
-        lock_trip = route_lock.get("trip_id")
-        if trip.get("route_id") == lock_route:
-            penalties -= ROUTE_LOCK_BONUS
-            if trip_id == lock_trip:
-                penalties -= SAME_TRIP_BONUS
-        else:
-            penalties += OTHER_ROUTE_PENALTY_WHEN_LOCKED
-
-    score = round(score + penalties, 1)
-
-    # delay estimation
-    expected_time_sec = distance_to_time(trip_id, current_distance_m)
-    delay_sec = int(now_sec - expected_time_sec)
-
+    trip = TRIPS.get(trip_id, {})
     return {
         "trip_id": trip_id,
         "route_id": trip.get("route_id"),
@@ -757,142 +707,200 @@ def _evaluate_candidate(trip_id, lat, lon, now_dt, prev_state):
         "nearest_stop_name": nearest_stop_name,
         "current_stop_sequence": nearest_stop_seq,
         "vehicle_stop_status": vehicle_stop_status,
-        "score": score,
         "delta_from_prev_m": delta_from_prev_m,
-        "reject_reason": reject_reason,
-        "penalties": penalties,
+        "rejected_motion": rejected_motion,
     }
 
 
-def _analyze_trip_candidates(lat, lon, now_dt, prev_state=None):
-    lat2, lon2 = _smooth_position(lat, lon, now_dt, prev_state)
-    cand_rows = _candidate_trips(now_dt)
+def _is_trip_finished(trip_id, now_dt):
+    prog = TRIP_PROGRESS.get(trip_id, [])
+    if not prog:
+        return False
+    now_sec = _seconds_since_midnight(now_dt)
+    return now_sec > int(prog[-1]["time_sec"]) + LOCKED_END_GRACE_SEC
 
-    if not cand_rows:
-        return {
-            "best_match": None,
-            "summary_reason": "no_candidate_trips_for_current_time",
-            "candidate_count": 0,
-            "top_candidate": None,
-            "candidates": [],
-        }
-
-    results = []
-    for row in cand_rows:
-        try:
-            results.append(_evaluate_candidate(row["trip_id"], lat2, lon2, now_dt, prev_state))
-        except Exception as e:
-            logger.error("candidate eval error trip=%s err=%s", row["trip_id"], e, exc_info=True)
-            results.append({
-                "trip_id": row["trip_id"],
-                "route_id": row["route_id"],
-                "shape_id": row["shape_id"],
-                "reject_reason": f"candidate_exception: {e}",
-                "score": 999999,
-            })
-
-    results.sort(key=lambda x: (x.get("score", 999999), x.get("distance_error_m", 999999), x.get("trip_id", "")))
-
-    accepted = [r for r in results if not r.get("reject_reason")]
-    best_match = accepted[0] if accepted else None
-    top_candidate = results[0] if results else None
-
-    if best_match:
-        summary_reason = "matched"
-    elif top_candidate:
-        summary_reason = top_candidate.get("reject_reason") or "candidate_exists_but_shape_match_failed"
-    else:
-        summary_reason = "candidate_exists_but_shape_match_failed"
-
-    return {
-        "best_match": best_match,
-        "summary_reason": summary_reason,
-        "candidate_count": len(results),
-        "top_candidate": top_candidate,
-        "candidates": results[:CANDIDATE_STORE_LIMIT],
-    }
-
-
-def match_trip(lat, lon, now_dt, prev_state=None):
-    analyzed = _analyze_trip_candidates(lat, lon, now_dt, prev_state=prev_state)
-    return analyzed["best_match"]
-
-
-def explain_trip_match_failure(lat, lon, now_dt, prev_state=None):
-    analyzed = _analyze_trip_candidates(lat, lon, now_dt, prev_state=prev_state)
-    return {
-        "summary_reason": analyzed["summary_reason"],
-        "candidate_count": analyzed["candidate_count"],
-        "top_candidate": analyzed["top_candidate"],
-        "candidates": analyzed["candidates"],
-    }
 
 # ============================================================
-# GTFS-RT builders
+# smoothing (TRIP_LOCKED only)
 # ============================================================
-def build_stop_time_updates(trip_id, delay_sec, current_distance_m=None, nearest_stop_sequence=None):
-    out = []
-    for st in TRIP_STOP_TIMES.get(trip_id, []):
-        seq = st["stop_sequence"]
-        stop_shape_d = STOP_TO_SHAPE_DIST.get((trip_id, seq))
+def smooth_locked_position(lat, lon, prev_state):
+    if not prev_state:
+        return lat, lon
+    plat = prev_state.get("lat")
+    plon = prev_state.get("lon")
+    if plat is None or plon is None:
+        return lat, lon
+    a = SMOOTH_ALPHA
+    return a * lat + (1 - a) * float(plat), a * lon + (1 - a) * float(plon)
 
-        # すでに通過済みの停留所は出さない
-        if current_distance_m is not None and stop_shape_d is not None:
-            if stop_shape_d < current_distance_m - 30:
-                continue
 
-        stu = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate()
-        stu.stop_sequence = seq
-        stu.stop_id = st["stop_id"]
-        stu.arrival.delay = int(delay_sec)
-        stu.departure.delay = int(delay_sec)
-        out.append(stu)
+# ============================================================
+# state machine
+# ============================================================
+DEFAULT_LOCK = {
+    "lock_state": "IDLE",
+    "locked_trip_id": None,
+    "candidate_trips": [],
+    "candidate_scores": {},
+    "candidate_gps_count": 0,
+    "lock_confirmed_at": None,
+    "lock_reason": None,
+    "acc_on_at": None,
+    "origin_stop_id": None,
+    "origin_zone_entered_at": None,
+    "departure_window_opened_at": None,
+    "last_accepted_at": None,
+}
+
+
+def load_lock_state(prev_state):
+    if not prev_state:
+        return dict(DEFAULT_LOCK)
+    raw = prev_state.get("lock") or {}
+    out = dict(DEFAULT_LOCK)
+    for k in DEFAULT_LOCK:
+        if k in raw:
+            out[k] = raw[k]
+    # 互換: 旧 trip フィールドから locked_trip_id を復旧（移行期）
+    if not out.get("locked_trip_id") and out.get("lock_state") == "TRIP_LOCKED":
+        t = prev_state.get("trip") or {}
+        if t.get("trip_id"):
+            out["locked_trip_id"] = t["trip_id"]
     return out
 
 
-def build_gtfs_rt_feed(lat, lon, timestamp_unix, trip_match, vehicle_id=VEHICLE_ID):
-    feed = gtfs_realtime_pb2.FeedMessage()
-    feed.header.gtfs_realtime_version = "2.0"
-    feed.header.incrementality = gtfs_realtime_pb2.FeedHeader.FULL_DATASET
-    feed.header.timestamp = int(timestamp_unix)
+def _reset_to_idle(reason):
+    s = dict(DEFAULT_LOCK)
+    s["lock_reason"] = reason
+    return s
 
-    ent = feed.entity.add()
-    ent.id = f"vp_{vehicle_id}"
-    ent.vehicle.vehicle.id = vehicle_id
-    ent.vehicle.position.latitude = float(lat)
-    ent.vehicle.position.longitude = float(lon)
-    ent.vehicle.timestamp = int(timestamp_unix)
 
-    if trip_match:
-        ent.vehicle.trip.trip_id = trip_match["trip_id"]
-        ent.vehicle.trip.route_id = trip_match["route_id"]
-        if trip_match.get("current_stop_sequence") is not None:
-            ent.vehicle.current_stop_sequence = int(trip_match["current_stop_sequence"])
+def advance_state(prev_state, lat, lon, now_dt, accepted, accuracy):
+    """
+    ステートマシン本体。
+    return: (new_lock_state_dict, trip_match_or_None, debug_dict)
+    """
+    lock = load_lock_state(prev_state)
+    now_unix = int(now_dt.timestamp())
+    debug = {"prev_state": lock["lock_state"], "transitions": []}
 
-        ent.vehicle.current_status = (
-            gtfs_realtime_pb2.VehiclePosition.STOPPED_AT
-            if trip_match.get("vehicle_stop_status") == "STOPPED_AT"
-            else gtfs_realtime_pb2.VehiclePosition.IN_TRANSIT_TO
-        )
+    # ----- 失敗GPSはステートを進めない（ログだけ残す） -----
+    if not accepted:
+        return lock, None, {**debug, "skipped_for_not_accepted": True}
 
-        stus = build_stop_time_updates(
-            trip_match["trip_id"],
-            int(trip_match.get("delay_sec", 0)),
-            trip_match.get("current_distance_m"),
-            trip_match.get("current_stop_sequence"),
-        )
+    # ----- 30分欠損があれば IDLE 復帰 -----
+    last_acc = lock.get("last_accepted_at")
+    if last_acc is not None and (now_unix - int(last_acc)) > NO_GPS_IDLE_SEC:
+        lock = _reset_to_idle("no_gps_timeout")
+        debug["transitions"].append("→IDLE(no_gps_timeout)")
 
-        if stus:
-            ent2 = feed.entity.add()
-            ent2.id = f"tu_{vehicle_id}"
-            tu = ent2.trip_update
-            tu.trip.trip_id = trip_match["trip_id"]
-            tu.trip.route_id = trip_match["route_id"]
-            tu.vehicle.id = vehicle_id
-            tu.timestamp = int(timestamp_unix)
-            tu.stop_time_update.extend(stus)
+    # ----- IDLE → PRE_SERVICE_MOVE -----
+    if lock["lock_state"] == "IDLE":
+        lock["lock_state"] = "PRE_SERVICE_MOVE"
+        lock["acc_on_at"] = now_unix
+        debug["transitions"].append("IDLE→PRE_SERVICE_MOVE")
 
-    return feed.SerializeToString()
+    # ----- PRE_SERVICE_MOVE タイムアウト -----
+    if lock["lock_state"] == "PRE_SERVICE_MOVE":
+        acc_on = lock.get("acc_on_at") or now_unix
+        if (now_unix - int(acc_on)) > PRE_SERVICE_MAX_SEC:
+            lock = _reset_to_idle("pre_service_timeout")
+            lock["lock_state"] = "PRE_SERVICE_MOVE"
+            lock["acc_on_at"] = now_unix
+            debug["transitions"].append("PRE_SERVICE_MOVE_RESET(timeout)")
+
+    # ----- PRE_SERVICE_MOVE → ORIGIN_WAITING -----
+    if lock["lock_state"] == "PRE_SERVICE_MOVE":
+        z = detect_origin_zone(lat, lon)
+        if z is not None:
+            origin_stop_id, _ = z
+            lock["lock_state"] = "ORIGIN_WAITING"
+            lock["origin_stop_id"] = origin_stop_id
+            lock["origin_zone_entered_at"] = now_unix
+            debug["transitions"].append(f"PRE_SERVICE_MOVE→ORIGIN_WAITING({origin_stop_id})")
+
+    # ----- ORIGIN_WAITING タイムアウト / ゾーン離脱 -----
+    if lock["lock_state"] == "ORIGIN_WAITING":
+        entered = lock.get("origin_zone_entered_at") or now_unix
+        if (now_unix - int(entered)) > ORIGIN_WAITING_MAX_SEC:
+            lock = _reset_to_idle("origin_waiting_timeout")
+            debug["transitions"].append("ORIGIN_WAITING→IDLE(timeout)")
+
+    if lock["lock_state"] == "ORIGIN_WAITING":
+        if is_outside_origin_zone(lat, lon, lock.get("origin_stop_id")):
+            # 一旦ゾーンから離れたら、別の origin に再入する可能性あり → PRE_SERVICE_MOVE に戻す
+            lock["lock_state"] = "PRE_SERVICE_MOVE"
+            lock["origin_stop_id"] = None
+            lock["origin_zone_entered_at"] = None
+            debug["transitions"].append("ORIGIN_WAITING→PRE_SERVICE_MOVE(left_zone)")
+
+    # ----- ORIGIN_WAITING → CANDIDATE_SEARCH -----
+    if lock["lock_state"] == "ORIGIN_WAITING":
+        service_ids = set(resolve_active_service_ids(now_dt))
+        candidates = find_departure_candidates(lock["origin_stop_id"], now_dt, service_ids)
+        if candidates:
+            lock["lock_state"] = "CANDIDATE_SEARCH"
+            lock["candidate_trips"] = [c["trip_id"] for c in candidates]
+            lock["candidate_scores"] = {}
+            lock["candidate_gps_count"] = 0
+            lock["departure_window_opened_at"] = now_unix
+            debug["transitions"].append(
+                f"ORIGIN_WAITING→CANDIDATE_SEARCH(n={len(candidates)})"
+            )
+            debug["candidates_found"] = [c["trip_id"] for c in candidates]
+
+    # ----- CANDIDATE_SEARCH 中処理 -----
+    trip_match = None
+    if lock["lock_state"] == "CANDIDATE_SEARCH":
+        service_ids = set(resolve_active_service_ids(now_dt))
+        # 候補集合を最新の時刻窓で更新（窓を抜けた便は除外）
+        live_candidates = find_departure_candidates(lock["origin_stop_id"], now_dt, service_ids)
+        live_ids = {c["trip_id"] for c in live_candidates}
+        # 既に追跡中の trip_id は維持しつつ、live に消えたものは候補から外す
+        prev_scores = {
+            tid: s for tid, s in (lock.get("candidate_scores") or {}).items()
+            if tid in live_ids
+        }
+        # 新規 live 候補は prev 0 から開始
+        scores = update_candidate_scores(prev_scores, live_candidates, lat, lon, now_dt)
+        gps_count = int(lock.get("candidate_gps_count", 0)) + 1
+
+        lock["candidate_scores"] = scores
+        lock["candidate_trips"] = list(scores.keys())
+        lock["candidate_gps_count"] = gps_count
+
+        decided_trip_id, reason = decide_trip_lock(scores, gps_count)
+        debug["candidate_lock_reason"] = reason
+
+        if decided_trip_id:
+            lock["lock_state"] = "TRIP_LOCKED"
+            lock["locked_trip_id"] = decided_trip_id
+            lock["lock_confirmed_at"] = now_unix
+            lock["lock_reason"] = reason
+            debug["transitions"].append(f"CANDIDATE_SEARCH→TRIP_LOCKED({decided_trip_id};{reason})")
+
+    # ----- TRIP_LOCKED 中処理 -----
+    if lock["lock_state"] == "TRIP_LOCKED":
+        trip_id = lock.get("locked_trip_id")
+        if not trip_id:
+            lock = _reset_to_idle("locked_without_trip_id")
+            debug["transitions"].append("TRIP_LOCKED→IDLE(missing_trip_id)")
+        else:
+            if _is_trip_finished(trip_id, now_dt):
+                lock = _reset_to_idle("trip_finished")
+                debug["transitions"].append(f"TRIP_LOCKED→IDLE(trip_finished {trip_id})")
+            else:
+                # 平滑化
+                slat, slon = smooth_locked_position(lat, lon, prev_state)
+                prev_trip = (prev_state or {}).get("trip") or {}
+                prev_dist = prev_trip.get("current_distance_m")
+                trip_match = track_locked_trip(trip_id, slat, slon, now_dt, prev_distance_m=prev_dist)
+
+    # ----- last_accepted_at 更新 -----
+    lock["last_accepted_at"] = now_unix
+
+    return lock, trip_match, debug
+
 
 # ============================================================
 # validation
@@ -930,10 +938,11 @@ def _validate_gps(data):
 
     return True, None
 
+
 # ============================================================
 # persistence
 # ============================================================
-def _thin_trip_match(tm):
+def _thin_trip(tm):
     if not tm:
         return None
     keys = [
@@ -943,47 +952,18 @@ def _thin_trip_match(tm):
         "expected_time_sec", "delay_sec",
         "nearest_stop_id", "nearest_stop_name",
         "current_stop_sequence", "vehicle_stop_status",
-        "score", "delta_from_prev_m",
+        "delta_from_prev_m", "rejected_motion",
     ]
     return {k: _safe_firestore_value(tm.get(k)) for k in keys if k in tm}
 
 
-def _thin_top_candidate(c):
-    if not c:
+def _thin_lock(lock):
+    if not lock:
         return None
-    keys = [
-        "trip_id", "route_id", "route_name", "shape_id",
-        "current_distance_m", "expected_distance_m", "distance_error_m",
-        "projection_offset_m", "score", "reject_reason",
-        "delta_from_prev_m", "nearest_stop_id", "nearest_stop_name",
-        "delay_sec",
-    ]
-    return {k: _safe_firestore_value(c.get(k)) for k in keys if k in c}
-
-
-def _thin_trip_debug(diag):
-    if not diag:
-        return None
-    return {
-        "reason": diag.get("summary_reason"),
-        "candidate_count": diag.get("candidate_count"),
-        "top_candidate": _thin_top_candidate(diag.get("top_candidate")),
-        "candidates": [_safe_firestore_value(c) for c in diag.get("candidates", [])[:CANDIDATE_STORE_LIMIT]],
-    }
-
-
-def _previous_context(prev_state):
-    prev_trip = _get_prev_trip(prev_state) or {}
-    prev_lock = _get_route_lock(prev_state)
-    return _safe_firestore_value({
-        "prev_trip_id": prev_trip.get("trip_id"),
-        "prev_route_id": prev_trip.get("route_id"),
-        "prev_shape_id": prev_trip.get("shape_id"),
-        "prev_current_distance_m": prev_trip.get("current_distance_m"),
-        "prev_timestamp_unix": prev_state.get("timestamp_unix") if prev_state else None,
-        "route_lock": prev_lock,
-        "last_event_id": prev_state.get("last_event_id") if prev_state else None,
-    })
+    out = {}
+    for k in DEFAULT_LOCK:
+        out[k] = _safe_firestore_value(lock.get(k))
+    return out
 
 
 def _persist_gtfs_rt_audit(vehicle_id, state, trip_match, pb):
@@ -1015,10 +995,9 @@ def _persist_observation(
     accepted,
     reject_reason,
     prev_state,
-    route_candidates,
+    new_lock,
     trip_match,
-    trip_diag,
-    route_lock,
+    debug,
 ):
     ts_unix = int(observed_dt.timestamp())
     lat = payload.get("lat")
@@ -1033,16 +1012,15 @@ def _persist_observation(
         "heading": _safe_firestore_value(payload.get("heading")),
     }
 
-    route_guess = route_candidates[0] if route_candidates else None
-    thin_trip = _thin_trip_match(trip_match)
-    thin_debug = _thin_trip_debug(trip_diag)
+    thin_trip = _thin_trip(trip_match)
+    thin_lock = _thin_lock(new_lock)
 
     event_ref = db.document(f"vehicles/{vehicle_id}/events/{event_id}")
     latest_ref = db.document(f"vehicles/{vehicle_id}/state/latest")
 
     batch = db.batch()
 
-    # gps_logs 互換
+    # gps_logs（生ログ・互換）
     log_doc = {
         "event_id": event_id,
         "vehicle_id": vehicle_id,
@@ -1059,14 +1037,13 @@ def _persist_observation(
         "speed": gps_block["speed"],
         "heading": gps_block["heading"],
         "raw": _safe_firestore_value(payload),
-        "route_guess": _safe_firestore_value(route_guess),
         "trip_match": _safe_firestore_value(thin_trip),
-        "trip_debug": _safe_firestore_value(thin_debug),
-        "route_lock": _safe_firestore_value(route_lock),
+        "lock": _safe_firestore_value(thin_lock),
+        "lock_debug": _safe_firestore_value(debug),
     }
     batch.set(db.collection("gps_logs").document(event_id), _safe_firestore_value(log_doc))
 
-    # complete event
+    # detail event
     event_doc = {
         "event_id": event_id,
         "vehicle_id": vehicle_id,
@@ -1079,33 +1056,34 @@ def _persist_observation(
         "reject_reason": reject_reason,
         "gps": gps_block,
         "raw": _safe_firestore_value(payload),
-        "route_guess": _safe_firestore_value(route_guess),
-        "route_candidates": _safe_firestore_value(route_candidates),
         "trip_match": _safe_firestore_value(thin_trip),
-        "trip_debug": _safe_firestore_value(thin_debug),
-        "route_lock": _safe_firestore_value(route_lock),
-        "previous_context": _previous_context(prev_state),
+        "lock": _safe_firestore_value(thin_lock),
+        "lock_debug": _safe_firestore_value(debug),
         "system": {
             "algorithm_version": ALGORITHM_VERSION,
             "precomputed_version": PRECOMPUTED_VERSION,
             "thresholds": {
-                "TRIP_TIME_BUFFER_SEC": TRIP_TIME_BUFFER_SEC,
-                "MAX_MATCH_ERROR_M": MAX_MATCH_ERROR_M,
+                "ORIGIN_GEOFENCE_RADIUS_M": ORIGIN_GEOFENCE_RADIUS_M,
+                "DEPARTURE_WINDOW_OPEN_SEC": DEPARTURE_WINDOW_OPEN_SEC,
+                "DEPARTURE_WINDOW_CLOSE_SEC": DEPARTURE_WINDOW_CLOSE_SEC,
+                "CANDIDATE_MIN_GPS_COUNT": CANDIDATE_MIN_GPS_COUNT,
+                "CANDIDATE_FORCE_GPS_COUNT": CANDIDATE_FORCE_GPS_COUNT,
+                "CANDIDATE_LOCK_GAP_M": CANDIDATE_LOCK_GAP_M,
+                "CANDIDATE_MAX_AVG_ERROR_M": CANDIDATE_MAX_AVG_ERROR_M,
                 "MAX_SHAPE_OFFSET_M": MAX_SHAPE_OFFSET_M,
-                "MAX_JUMP_DISTANCE_M": MAX_JUMP_DISTANCE_M,
-                "REVERSE_REJECT_M": REVERSE_REJECT_M,
-                "STOP_NEAR_GEO_THRESHOLD_M": STOP_NEAR_GEO_THRESHOLD_M,
-                "SMOOTHING_LOOKBACK_SEC": SMOOTHING_LOOKBACK_SEC,
-                "LOCK_ESTABLISH_COUNT": LOCK_ESTABLISH_COUNT,
-                "LOCK_RELEASE_NOMATCH_SEC": LOCK_RELEASE_NOMATCH_SEC,
+                "NO_GPS_IDLE_SEC": NO_GPS_IDLE_SEC,
             },
         },
     }
     batch.set(event_ref, _safe_firestore_value(event_doc))
 
-    # candidate subcollection
-    for idx, cand in enumerate((trip_diag or {}).get("candidates", [])[:CANDIDATE_STORE_LIMIT], start=1):
-        candidate_id = f"{idx:02d}_{cand.get('trip_id', 'unknown')}"
+    # candidate scores 詳細
+    scores = (new_lock or {}).get("candidate_scores") or {}
+    for idx, (tid, s) in enumerate(
+        sorted(scores.items(), key=lambda kv: kv[1].get("score", 1e18))[:CANDIDATE_STORE_LIMIT],
+        start=1,
+    ):
+        candidate_id = f"{idx:02d}_{tid}"
         candidate_doc = {
             "rank": idx,
             "event_id": event_id,
@@ -1113,34 +1091,104 @@ def _persist_observation(
             "observed_unix": ts_unix,
             "created_at": _firestore_mod.SERVER_TIMESTAMP,
             "expire_at": _expire_at(),
-            **_safe_firestore_value(cand),
+            **_safe_firestore_value(s),
         }
         batch.set(event_ref.collection("candidates").document(candidate_id), candidate_doc)
 
-    latest_doc = {
-        "vehicle_id": vehicle_id,
-        "last_event_id": event_id,
-        "lat": gps_block["lat"],
-        "lon": gps_block["lon"],
-        "accuracy": gps_block["accuracy"],
-        "speed": gps_block["speed"],
-        "heading": gps_block["heading"],
-        "timestamp": payload.get("timestamp"),
-        "timestamp_unix": ts_unix,
-        "server_received_at": observed_dt.isoformat(),
-        "updated_at": _firestore_mod.SERVER_TIMESTAMP,
-        "accepted": accepted,
-        "reject_reason": reject_reason,
-        "route_guess": _safe_firestore_value(route_guess),
-        "route_candidates": _safe_firestore_value(route_candidates[:3]),
-        "trip": _safe_firestore_value(thin_trip),
-        "trip_debug": _safe_firestore_value(thin_debug),
-        "route_lock": _safe_firestore_value(route_lock),
-    }
-    batch.set(latest_ref, _safe_firestore_value(latest_doc), merge=True)
+    # latest（out-of-order 防止: 古いタイムスタンプは latest を更新しない）
+    prev_ts = (prev_state or {}).get("timestamp_unix") or 0
+    skip_latest_update = False
+    if accepted and ts_unix < int(prev_ts):
+        skip_latest_update = True
+
+    if not skip_latest_update:
+        latest_doc = {
+            "vehicle_id": vehicle_id,
+            "last_event_id": event_id,
+            "lat": gps_block["lat"],
+            "lon": gps_block["lon"],
+            "accuracy": gps_block["accuracy"],
+            "speed": gps_block["speed"],
+            "heading": gps_block["heading"],
+            "timestamp": payload.get("timestamp"),
+            "timestamp_unix": ts_unix,
+            "server_received_at": observed_dt.isoformat(),
+            "updated_at": _firestore_mod.SERVER_TIMESTAMP,
+            "accepted": accepted,
+            "reject_reason": reject_reason,
+            "trip": _safe_firestore_value(thin_trip),
+            "lock": _safe_firestore_value(thin_lock),
+            "algorithm_version": ALGORITHM_VERSION,
+        }
+        batch.set(latest_ref, _safe_firestore_value(latest_doc), merge=True)
 
     batch.commit()
-    return event_id
+    return event_id, skip_latest_update
+
+
+# ============================================================
+# GTFS-RT builder
+# ============================================================
+def build_stop_time_updates(trip_id, delay_sec, current_distance_m=None):
+    out = []
+    for st in TRIP_STOP_TIMES.get(trip_id, []):
+        seq = st["stop_sequence"]
+        stop_shape_d = STOP_TO_SHAPE_DIST.get((trip_id, seq))
+
+        if current_distance_m is not None and stop_shape_d is not None:
+            if stop_shape_d < current_distance_m - 30:
+                continue
+
+        stu = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate()
+        stu.stop_sequence = seq
+        stu.stop_id = st["stop_id"]
+        stu.arrival.delay = int(delay_sec)
+        stu.departure.delay = int(delay_sec)
+        out.append(stu)
+    return out
+
+
+def build_gtfs_rt_feed(lat, lon, timestamp_unix, trip_match, vehicle_id=VEHICLE_ID):
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.header.gtfs_realtime_version = "2.0"
+    feed.header.incrementality = gtfs_realtime_pb2.FeedHeader.FULL_DATASET
+    feed.header.timestamp = int(timestamp_unix)
+
+    ent = feed.entity.add()
+    ent.id = f"vp_{vehicle_id}"
+    ent.vehicle.vehicle.id = vehicle_id
+    ent.vehicle.position.latitude = float(lat)
+    ent.vehicle.position.longitude = float(lon)
+    ent.vehicle.timestamp = int(timestamp_unix)
+
+    if trip_match and trip_match.get("trip_id"):
+        ent.vehicle.trip.trip_id = trip_match["trip_id"]
+        ent.vehicle.trip.route_id = trip_match["route_id"]
+        if trip_match.get("current_stop_sequence") is not None:
+            ent.vehicle.current_stop_sequence = int(trip_match["current_stop_sequence"])
+        ent.vehicle.current_status = (
+            gtfs_realtime_pb2.VehiclePosition.STOPPED_AT
+            if trip_match.get("vehicle_stop_status") == "STOPPED_AT"
+            else gtfs_realtime_pb2.VehiclePosition.IN_TRANSIT_TO
+        )
+
+        stus = build_stop_time_updates(
+            trip_match["trip_id"],
+            int(trip_match.get("delay_sec", 0)),
+            trip_match.get("current_distance_m"),
+        )
+        if stus:
+            ent2 = feed.entity.add()
+            ent2.id = f"tu_{vehicle_id}"
+            tu = ent2.trip_update
+            tu.trip.trip_id = trip_match["trip_id"]
+            tu.trip.route_id = trip_match["route_id"]
+            tu.vehicle.id = vehicle_id
+            tu.timestamp = int(timestamp_unix)
+            tu.stop_time_update.extend(stus)
+
+    return feed.SerializeToString()
+
 
 # ============================================================
 # HTTP functions
@@ -1173,70 +1221,70 @@ def gps(req):
     snap = latest_ref.get()
     prev_state = snap.to_dict() if snap.exists else None
 
-    lat = data.get("lat")
-    lon = data.get("lon")
-
-    route_candidates = []
-    trip_diag = None
+    new_lock = load_lock_state(prev_state)
     trip_match = None
+    debug = {"prev_state": new_lock["lock_state"], "transitions": []}
 
     if accepted:
         try:
-            lat = float(lat)
-            lon = float(lon)
-
-            route_candidates = estimate_route_candidates(lat, lon, topn=5)
-            trip_diag = _analyze_trip_candidates(lat, lon, observed_dt, prev_state=prev_state)
-            trip_match = trip_diag.get("best_match")
+            lat_f = float(data.get("lat"))
+            lon_f = float(data.get("lon"))
+            new_lock, trip_match, debug = advance_state(
+                prev_state,
+                lat_f,
+                lon_f,
+                observed_dt,
+                accepted=True,
+                accuracy=data.get("accuracy"),
+            )
         except Exception as e:
-            logger.error("gps processing error: %s", e, exc_info=True)
-            trip_diag = {
-                "summary_reason": "match_trip_exception",
-                "candidate_count": 0,
-                "top_candidate": None,
-                "candidates": [],
-            }
+            logger.error("gps state machine error: %s", e, exc_info=True)
+            debug = {"error": f"state_machine_exception:{e}"}
 
-    route_lock = _compute_route_lock(prev_state, trip_match, observed_dt)
-
-    event_id = _persist_observation(
+    event_id, skipped_latest = _persist_observation(
         vehicle_id=vehicle_id,
         payload=data,
         observed_dt=observed_dt,
         accepted=accepted,
         reject_reason=reject_reason,
         prev_state=prev_state,
-        route_candidates=route_candidates,
+        new_lock=new_lock,
         trip_match=trip_match,
-        trip_diag=trip_diag,
-        route_lock=route_lock,
+        debug=debug,
     )
 
     resp = {
         "ok": True,
-
+        "accepted": accepted,
+        "lock_state": new_lock["lock_state"],
+        "origin_stop_id": new_lock.get("origin_stop_id"),
+        "candidate_count": len(new_lock.get("candidate_trips") or []),
+        "candidate_gps_count": new_lock.get("candidate_gps_count", 0),
+        "locked_trip_id": new_lock.get("locked_trip_id"),
+        "lock_reason": new_lock.get("lock_reason"),
+        "skipped_latest_update": skipped_latest,
+        "event_id": event_id,
     }
 
-    if trip_match:
+    if not accepted:
+        resp["reject_reason"] = reject_reason
+
+    if trip_match and trip_match.get("trip_id"):
+        delay_sec = int(trip_match.get("delay_sec", 0) or 0)
         resp["trip"] = {
             "trip_id": trip_match["trip_id"],
             "route_id": trip_match["route_id"],
-            "route_name": trip_match["route_name"],
+            "route_name": trip_match.get("route_name"),
             "nearest_stop": trip_match.get("nearest_stop_name"),
             "status": trip_match.get("vehicle_stop_status"),
             "current_distance_m": trip_match.get("current_distance_m"),
             "expected_distance_m": trip_match.get("expected_distance_m"),
             "distance_error_m": trip_match.get("distance_error_m"),
             "offset_m": trip_match.get("projection_offset_m"),
-            "delay_sec": trip_match.get("delay_sec"),
-            "delay_min": round(trip_match.get("delay_sec", 0) / 60.0, 1),
-            "score": trip_match.get("score"),
+            "delay_sec": delay_sec,
+            "delay_min": round(delay_sec / 60.0, 1),
+            "rejected_motion": trip_match.get("rejected_motion"),
         }
-    else:
-        resp["trip_debug"] = _thin_trip_debug(trip_diag)
-
-    if not accepted:
-        resp["reject_reason"] = reject_reason
 
     return (resp, 200, _cors_headers("application/json"))
 
@@ -1261,21 +1309,11 @@ def gtfs_rt(req):
 
     state = doc.to_dict()
 
+    # 再推定はしない。確定した trip だけを反映する。
     trip_match = None
-    if state.get("trip") and state["trip"].get("trip_id"):
-        trip_match = state["trip"]
-    elif state.get("lat") is not None and state.get("lon") is not None:
-        try:
-            observed_dt = datetime.fromtimestamp(int(state.get("timestamp_unix", int(time.time()))), tz=JST)
-            trip_diag = _analyze_trip_candidates(
-                float(state["lat"]),
-                float(state["lon"]),
-                observed_dt,
-                prev_state=state,
-            )
-            trip_match = trip_diag.get("best_match")
-        except Exception as e:
-            logger.error("gtfs_rt fallback error: %s", e, exc_info=True)
+    lock = state.get("lock") or {}
+    if lock.get("lock_state") == "TRIP_LOCKED":
+        trip_match = state.get("trip")  # latest に保存されている確定済み trip
 
     pb = build_gtfs_rt_feed(
         float(state.get("lat", 0.0)),
