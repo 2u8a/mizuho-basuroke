@@ -49,7 +49,7 @@ JST = timezone(timedelta(hours=9))
 VEHICLE_ID = "mizuho-bus-01"
 GTFS_DIR = os.path.join(os.path.dirname(__file__), "data", "gtfs")
 
-ALGORITHM_VERSION = "trip-lock-state-machine-v3"
+ALGORITHM_VERSION = "trip-lock-state-machine-v3.2-seq-tracking"
 
 # --- geo / area ---
 EARTH_RADIUS_M = 6_371_000
@@ -68,13 +68,22 @@ DEPARTURE_WINDOW_CLOSE_SEC = 10 * 60   # 出発10分後までは候補探索継�
 CANDIDATE_MIN_GPS_COUNT = 5            # 通常確定の最小GPS受信回数
 CANDIDATE_FORCE_GPS_COUNT = 15         # 強制確定の上限
 CANDIDATE_LOCK_GAP_M = 300.0           # 1位と2位の累積誤差差（m）
-CANDIDATE_MAX_AVG_ERROR_M = 1000.0      # 1位の平均距離誤差上限
+CANDIDATE_MAX_AVG_ERROR_M = 400.0      # 1位の平均距離誤差上限
 MAX_SHAPE_OFFSET_M = 250.0             # shape横ずれ上限（候補棄却用）
 
 # --- TRIP_LOCKED 中の追跡 ---
 SMOOTH_ALPHA = 0.6                     # 直近GPSへの寄せ係数（0.6:0.4 = current:prev）
 LOCKED_REVERSE_REJECT_M = 200.0        # ロック後の逆行棄却（保存はする/採用しない）
 LOCKED_JUMP_REJECT_M = 1500.0          # ジャンプ棄却
+
+# --- シーケンシャルトラッキング（往復重複ルートの誤スナップ対策） ---
+SEARCH_LOOKBEHIND_M = 100.0            # 通過済み停留所からの戻り許容
+SEARCH_LOOKAHEAD_STOPS = 2             # 何個先の停留所までを探索範囲にするか
+SEARCH_LOOKAHEAD_BUFFER_M = 500.0      # 先頭側の遊び（停留所間が長い区間の救済）
+STOP_PASS_THRESHOLD_M = 30.0           # 次停留所の距離をこの幅で超えたら「通過」とみなす
+
+# --- 始発保留（早着配信防止） ---
+ORIGIN_HOLD_RELEASE_DISTANCE_M = 50.0  # 始発から何m離れたら「実際に出発」とみなすか
 
 # --- IDLE 復帰条件 ---
 LOCKED_END_GRACE_SEC = 15 * 60         # 終着時刻+15分でIDLE復帰
@@ -347,14 +356,29 @@ def _project_point_to_segment(lat, lon, a, b):
     }
 
 
-def project_to_shape(shape_id, lat, lon):
+def project_to_shape(shape_id, lat, lon, dist_min=None, dist_max=None):
+    """
+    GPS点を shape の最近接点に投影する。
+
+    dist_min / dist_max を与えると、shape上の累積距離がその範囲に重なるセグメントだけを
+    探索対象にする。往復重複shapeで復路走行中に往路セグメントへ誤スナップされるのを防ぐための重要なガード。
+    """
     pts = SHAPES.get(shape_id)
     if not pts or len(pts) < 2:
         return None
 
     best = None
     for i in range(len(pts) - 1):
-        proj = _project_point_to_segment(lat, lon, pts[i], pts[i + 1])
+        a, b = pts[i], pts[i + 1]
+        if dist_min is not None or dist_max is not None:
+            seg_lo = min(a["dist_traveled"], b["dist_traveled"])
+            seg_hi = max(a["dist_traveled"], b["dist_traveled"])
+            if dist_max is not None and seg_lo > dist_max:
+                continue
+            if dist_min is not None and seg_hi < dist_min:
+                continue
+
+        proj = _project_point_to_segment(lat, lon, a, b)
         cand = {**proj, "shape_id": shape_id, "segment_index": i}
         if best is None or cand["offset_m"] < best["offset_m"] - 1.0:
             best = cand
@@ -364,9 +388,63 @@ def project_to_shape(shape_id, lat, lon):
     return best
 
 
-def _project_to_trip_distance(trip_id, lat, lon, anchor_distance_m=None):
+def _stop_distance_on_trip(trip_id, seq):
+    """trip上のある stop_sequence に対応する距離を返す。None なら未定義。"""
+    return STOP_TO_SHAPE_DIST.get((trip_id, seq))
+
+
+def _trip_last_sequence(trip_id):
+    sts = TRIP_STOP_TIMES.get(trip_id, [])
+    if not sts:
+        return None
+    return sts[-1]["stop_sequence"]
+
+
+def resolve_search_window(trip_id, current_seq,
+                          look_ahead_stops=SEARCH_LOOKAHEAD_STOPS,
+                          look_behind_m=SEARCH_LOOKBEHIND_M,
+                          look_ahead_m=SEARCH_LOOKAHEAD_BUFFER_M):
+    """
+    現在の current_seq を起点に、project_to_shape へ渡す探索範囲 (dist_min, dist_max) を計算する。
+    未定義なら (None, None) を返し、全体探索にフォールバックさせる。
+    """
+    if not trip_id or not current_seq:
+        return None, None
+    last_seq = _trip_last_sequence(trip_id) or current_seq
+
+    cur_d = _stop_distance_on_trip(trip_id, current_seq)
+    ahead_seq = min(current_seq + look_ahead_stops, last_seq)
+    ahead_d = _stop_distance_on_trip(trip_id, ahead_seq)
+
+    if cur_d is None and ahead_d is None:
+        return None, None
+
+    lo = (cur_d if cur_d is not None else ahead_d) - look_behind_m
+    hi = (ahead_d if ahead_d is not None else cur_d) + look_ahead_m
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def _project_to_trip_distance(trip_id, lat, lon, anchor_distance_m=None,
+                              search_window=None):
+    """
+    tripの shape に GPS を投影し、trip起点からの距離 distance_m を返す。
+    search_window=(dist_min, dist_max) を与えると、その範囲だけを探索する。
+    """
     shape_id = TRIPS[trip_id]["shape_id"]
-    proj = project_to_shape(shape_id, lat, lon)
+    if search_window is None:
+        proj = project_to_shape(shape_id, lat, lon)
+    else:
+        # search_window は trip起点基準。project_to_shape へは shape 絶対距離に換算する。
+        base_abs = TRIP_SHAPE_START_ABS.get(trip_id, 0.0)
+        lo_rel, hi_rel = search_window
+        dist_min = (base_abs + lo_rel) if lo_rel is not None else None
+        dist_max = (base_abs + hi_rel) if hi_rel is not None else None
+        proj = project_to_shape(shape_id, lat, lon, dist_min=dist_min, dist_max=dist_max)
+        if proj is None:
+            # 範囲外フォールバック（ジオフェンス上で拾えなかった場合の保険）
+            proj = project_to_shape(shape_id, lat, lon)
     if proj is None:
         return None
 
@@ -553,8 +631,11 @@ def _nearest_progress_stop(trip_id, current_distance_m):
 # candidate scoring (CANDIDATE_SEARCH 内)
 # ============================================================
 def evaluate_candidate_once(trip_id, lat, lon, now_dt):
-    """1回のGPSでの候補評価。距離誤差 distance_error_m を返す。"""
-    proj = _project_to_trip_distance(trip_id, lat, lon)
+    """複数便選択中の評価。始発周辺に探索を限定することで、
+    往復重複shapeの誤スナップを防ぐ。"""
+    # 候補探索中は current_seq=1 スタートとみなして、始発周辺に限定
+    sw = resolve_search_window(trip_id, 1)
+    proj = _project_to_trip_distance(trip_id, lat, lon, search_window=sw)
     if proj is None:
         return None
 
@@ -657,30 +738,57 @@ def decide_trip_lock(scores, gps_count):
 # ============================================================
 # locked tracking
 # ============================================================
-def track_locked_trip(trip_id, lat, lon, now_dt, prev_distance_m=None):
+def update_passed_sequence(trip_id, current_seq, current_distance_m):
+    """
+    現在の current_seq から、次以降の停留所の距離を越えていたら seq をカウントアップする。
+    """
+    if not current_seq:
+        return 1
+    last_seq = _trip_last_sequence(trip_id)
+    if last_seq is None:
+        return current_seq
+    seq = current_seq
+    while seq < last_seq:
+        next_d = _stop_distance_on_trip(trip_id, seq + 1)
+        if next_d is None:
+            break
+        if current_distance_m + STOP_PASS_THRESHOLD_M >= next_d:
+            seq += 1
+        else:
+            break
+    return seq
+
+
+def track_locked_trip(trip_id, lat, lon, now_dt, prev_distance_m=None,
+                     lock_progress=None):
     """
     TRIP_LOCKED 中の遅延追跡。
-    prev_distance_m があれば逆行・ジャンプの安全弁を効かせる（accept判定）。
+    lock_progress = {
+        current_stop_sequence: int,
+        max_passed_stop_sequence: int,
+        last_distance_m: float,
+    }
+    シーケンスベースで shape 探索範囲を限定し、往復重複shapeの誤スナップを防ぐ。
+    始発保留中は 遅延=0、進捗=0 とし、早着配信を防ぐ。
+    戻り値に lock_progress_next を含める。
     """
-    proj = _project_to_trip_distance(trip_id, lat, lon, anchor_distance_m=prev_distance_m)
+    progress = dict(lock_progress or {})
+    cur_seq = int(progress.get("current_stop_sequence") or 1)
+    max_passed_seq = int(progress.get("max_passed_stop_sequence") or cur_seq)
+
+    # 探索範囲（trip起点基準）を計算
+    sw = resolve_search_window(trip_id, cur_seq)
+    proj = _project_to_trip_distance(
+        trip_id, lat, lon,
+        anchor_distance_m=prev_distance_m,
+        search_window=sw,
+    )
     if proj is None:
         return None
 
     current_distance_m = float(proj["distance_m"])
-    now_sec = _seconds_since_midnight(now_dt)
-    expected_distance_m = float(time_to_distance(trip_id, now_sec))
-    distance_error_m = abs(current_distance_m - expected_distance_m)
-    expected_time_sec = distance_to_time(trip_id, current_distance_m)
-    delay_sec = int(now_sec - expected_time_sec)
 
-    nearest_stop_id, nearest_stop_seq, nearest_stop_name, nearest_stop_dist = _nearest_progress_stop(
-        trip_id, current_distance_m
-    )
-
-    vehicle_stop_status = "IN_TRANSIT_TO"
-    if nearest_stop_dist is not None and abs(nearest_stop_dist - current_distance_m) <= STOP_NEAR_GEO_THRESHOLD_M:
-        vehicle_stop_status = "STOPPED_AT"
-
+    # 逆行・ジャンプ検知
     delta_from_prev_m = None
     rejected_motion = None
     if prev_distance_m is not None:
@@ -690,7 +798,56 @@ def track_locked_trip(trip_id, lat, lon, now_dt, prev_distance_m=None):
         elif abs(delta_from_prev_m) > LOCKED_JUMP_REJECT_M:
             rejected_motion = f"jump_too_large({delta_from_prev_m:.0f}m)"
 
+    # 逆行を検知した場合は現在距離を保護する（seq は下げない）
+    if rejected_motion and prev_distance_m is not None:
+        current_distance_m = max(current_distance_m, float(prev_distance_m))
+
+    # シーケンス更新
+    new_seq = update_passed_sequence(trip_id, cur_seq, current_distance_m)
+    if new_seq < max_passed_seq:
+        new_seq = max_passed_seq  # 一旦通過したら逆行させない
+    new_max_passed = max(max_passed_seq, new_seq)
+
+    # 始発保留判定（課題1対策）
+    now_sec = _seconds_since_midnight(now_dt)
+    sched_dep_sec = TRIP_ORIGIN_DEP_SEC.get(trip_id)
+    holding_at_origin = False
+    if sched_dep_sec is not None and now_sec < int(sched_dep_sec):
+        # まだ出発予定時刻前
+        if current_distance_m < ORIGIN_HOLD_RELEASE_DISTANCE_M and new_seq <= 1:
+            holding_at_origin = True
+
+    if holding_at_origin:
+        expected_distance_m = 0.0
+        expected_time_sec = int(sched_dep_sec)
+        delay_sec = 0
+        distance_error_m = current_distance_m
+        vehicle_stop_status = "STOPPED_AT"
+    else:
+        expected_distance_m = float(time_to_distance(trip_id, now_sec))
+        distance_error_m = abs(current_distance_m - expected_distance_m)
+        expected_time_sec = distance_to_time(trip_id, current_distance_m)
+        delay_sec = int(now_sec - expected_time_sec)
+        vehicle_stop_status = "IN_TRANSIT_TO"
+
+    nearest_stop_id, nearest_stop_seq, nearest_stop_name, nearest_stop_dist = _nearest_progress_stop(
+        trip_id, current_distance_m
+    )
+
+    if (not holding_at_origin
+        and nearest_stop_dist is not None
+        and abs(nearest_stop_dist - current_distance_m) <= STOP_NEAR_GEO_THRESHOLD_M):
+        vehicle_stop_status = "STOPPED_AT"
+
     trip = TRIPS.get(trip_id, {})
+    lock_progress_next = {
+        "current_stop_sequence": int(new_seq),
+        "max_passed_stop_sequence": int(new_max_passed),
+        "last_distance_m": round(current_distance_m, 1),
+        "last_updated_at": int(now_dt.timestamp()),
+        "holding_at_origin": bool(holding_at_origin),
+    }
+
     return {
         "trip_id": trip_id,
         "route_id": trip.get("route_id"),
@@ -705,10 +862,15 @@ def track_locked_trip(trip_id, lat, lon, now_dt, prev_distance_m=None):
         "delay_sec": int(delay_sec),
         "nearest_stop_id": nearest_stop_id,
         "nearest_stop_name": nearest_stop_name,
-        "current_stop_sequence": nearest_stop_seq,
+        # 従来名称互換: nearest だったものを current_stop_sequence として出していたが、
+        # 今回からは 進捗シーケンス をセットする。
+        "current_stop_sequence": int(new_seq),
+        "max_passed_stop_sequence": int(new_max_passed),
+        "holding_at_origin": bool(holding_at_origin),
         "vehicle_stop_status": vehicle_stop_status,
         "delta_from_prev_m": delta_from_prev_m,
         "rejected_motion": rejected_motion,
+        "lock_progress_next": lock_progress_next,
     }
 
 
@@ -773,6 +935,8 @@ DEFAULT_LOCK = {
     "origin_zone_entered_at": None,
     "departure_window_opened_at": None,
     "last_accepted_at": None,
+    # シーケンシャルトラッキング（課題2対応）
+    "locked_trip_progress": None,
 }
 
 
@@ -900,6 +1064,14 @@ def advance_state(prev_state, lat, lon, now_dt, accepted, accuracy):
             lock["locked_trip_id"] = decided_trip_id
             lock["lock_confirmed_at"] = now_unix
             lock["lock_reason"] = reason
+            # シーケンス追跡の初期化（課題2対応）
+            lock["locked_trip_progress"] = {
+                "current_stop_sequence": 1,
+                "max_passed_stop_sequence": 1,
+                "last_distance_m": 0.0,
+                "last_updated_at": now_unix,
+                "holding_at_origin": True,
+            }
             debug["transitions"].append(f"CANDIDATE_SEARCH→TRIP_LOCKED({decided_trip_id};{reason})")
 
     # ----- TRIP_LOCKED 中処理 -----
@@ -913,7 +1085,15 @@ def advance_state(prev_state, lat, lon, now_dt, accepted, accuracy):
             slat, slon = smooth_locked_position(lat, lon, prev_state)
             prev_trip = (prev_state or {}).get("trip") or {}
             prev_dist = prev_trip.get("current_distance_m")
-            trip_match = track_locked_trip(trip_id, slat, slon, now_dt, prev_distance_m=prev_dist)
+            trip_match = track_locked_trip(
+                trip_id, slat, slon, now_dt,
+                prev_distance_m=prev_dist,
+                lock_progress=lock.get("locked_trip_progress"),
+            )
+
+            # シーケンス進捗を lock に反映
+            if trip_match and trip_match.get("lock_progress_next"):
+                lock["locked_trip_progress"] = trip_match["lock_progress_next"]
 
             if _is_trip_finished(
                 trip_id,
@@ -980,7 +1160,9 @@ def _thin_trip(tm):
         "projection_offset_m", "abs_distance_m",
         "expected_time_sec", "delay_sec",
         "nearest_stop_id", "nearest_stop_name",
-        "current_stop_sequence", "vehicle_stop_status",
+        "current_stop_sequence", "max_passed_stop_sequence",
+        "holding_at_origin",
+        "vehicle_stop_status",
         "delta_from_prev_m", "rejected_motion",
     ]
     return {k: _safe_firestore_value(tm.get(k)) for k in keys if k in tm}
@@ -1158,21 +1340,32 @@ def _persist_observation(
 # ============================================================
 # GTFS-RT builder
 # ============================================================
-def build_stop_time_updates(trip_id, delay_sec, current_distance_m=None):
+def build_stop_time_updates(trip_id, delay_sec, current_distance_m=None,
+                            current_stop_sequence=None, holding_at_origin=False):
+    """
+    始発保留中は delay_sec を 0 に強制し、マイナス遅延（早着）を配信しない。
+    進捗済みそれより手前の停留所は current_stop_sequence も考慮して除外。
+    """
+    effective_delay = 0 if holding_at_origin else int(delay_sec)
     out = []
     for st in TRIP_STOP_TIMES.get(trip_id, []):
         seq = st["stop_sequence"]
         stop_shape_d = STOP_TO_SHAPE_DIST.get((trip_id, seq))
 
+        # 距離ベースでの通過済み除外
         if current_distance_m is not None and stop_shape_d is not None:
             if stop_shape_d < current_distance_m - 30:
                 continue
 
+        # シーケンスベースでの通過済み除外
+        if current_stop_sequence is not None and seq < int(current_stop_sequence):
+            continue
+
         stu = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate()
         stu.stop_sequence = seq
         stu.stop_id = st["stop_id"]
-        stu.arrival.delay = int(delay_sec)
-        stu.departure.delay = int(delay_sec)
+        stu.arrival.delay = effective_delay
+        stu.departure.delay = effective_delay
         out.append(stu)
     return out
 
@@ -1204,7 +1397,9 @@ def build_gtfs_rt_feed(lat, lon, timestamp_unix, trip_match, vehicle_id=VEHICLE_
         stus = build_stop_time_updates(
             trip_match["trip_id"],
             int(trip_match.get("delay_sec", 0)),
-            trip_match.get("current_distance_m"),
+            current_distance_m=trip_match.get("current_distance_m"),
+            current_stop_sequence=trip_match.get("current_stop_sequence"),
+            holding_at_origin=bool(trip_match.get("holding_at_origin")),
         )
         if stus:
             ent2 = feed.entity.add()
@@ -1312,6 +1507,9 @@ def gps(req):
             "offset_m": trip_match.get("projection_offset_m"),
             "delay_sec": delay_sec,
             "delay_min": round(delay_sec / 60.0, 1),
+            "current_stop_sequence": trip_match.get("current_stop_sequence"),
+            "max_passed_stop_sequence": trip_match.get("max_passed_stop_sequence"),
+            "holding_at_origin": trip_match.get("holding_at_origin"),
             "rejected_motion": trip_match.get("rejected_motion"),
         }
 
