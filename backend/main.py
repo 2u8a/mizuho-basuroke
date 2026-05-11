@@ -403,6 +403,40 @@ def _trip_last_sequence(trip_id):
     return sts[-1]["stop_sequence"]
 
 
+def _trip_first_stop_sequence(trip_id):
+    sts = TRIP_STOP_TIMES.get(trip_id, [])
+    if not sts:
+        return None
+    return int(sts[0]["stop_sequence"])
+
+
+def _trip_index_for_sequence(trip_id, current_seq):
+    """
+    TRIP_STOP_TIMES[trip_id]（stop_sequence 昇順）上で、current_seq に対応するインデックスを返す。
+    完全一致がなければ、stop_sequence <= current_seq となる最右インデックス（通過済みとみなせる停留所）。
+    current_seq より手前に該当がなければ 0。
+    """
+    sts = TRIP_STOP_TIMES.get(trip_id, [])
+    if not sts:
+        return None
+    if current_seq is None:
+        return 0
+    cur = int(current_seq)
+    lo, hi = 0, len(sts) - 1
+    best = -1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        s = int(sts[mid]["stop_sequence"])
+        if s <= cur:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best < 0:
+        return 0
+    return best
+
+
 def resolve_search_window(trip_id, current_seq,
                           look_ahead_stops=SEARCH_LOOKAHEAD_STOPS,
                           look_behind_m=SEARCH_LOOKBEHIND_M,
@@ -410,13 +444,23 @@ def resolve_search_window(trip_id, current_seq,
     """
     現在の current_seq を起点に、project_to_shape へ渡す探索範囲 (dist_min, dist_max) を計算する。
     未定義なら (None, None) を返し、全体探索にフォールバックさせる。
+    次停留所・先読みは TRIP_STOP_TIMES の配列インデックスで進め、GTFS の stop_sequence の欠番に依存しない。
     """
-    if not trip_id or not current_seq:
+    if not trip_id or current_seq is None:
         return None, None
-    last_seq = _trip_last_sequence(trip_id) or current_seq
+    sts = TRIP_STOP_TIMES.get(trip_id, [])
+    if not sts:
+        return None, None
 
-    cur_d = _stop_distance_on_trip(trip_id, current_seq)
-    ahead_seq = min(current_seq + look_ahead_stops, last_seq)
+    idx = _trip_index_for_sequence(trip_id, current_seq)
+    if idx is None:
+        return None, None
+    ahead_idx = min(idx + look_ahead_stops, len(sts) - 1)
+
+    seq_at_idx = int(sts[idx]["stop_sequence"])
+    ahead_seq = int(sts[ahead_idx]["stop_sequence"])
+
+    cur_d = _stop_distance_on_trip(trip_id, seq_at_idx)
     ahead_d = _stop_distance_on_trip(trip_id, ahead_seq)
 
     if cur_d is None and ahead_d is None:
@@ -636,8 +680,10 @@ def _nearest_progress_stop(trip_id, current_distance_m):
 def evaluate_candidate_once(trip_id, lat, lon, now_dt):
     """複数便選択中の評価。始発周辺に探索を限定することで、
     往復重複shapeの誤スナップを防ぐ。"""
-    # 候補探索中は current_seq=1 スタートとみなして、始発周辺に限定
-    sw = resolve_search_window(trip_id, 1)
+    first_seq = _trip_first_stop_sequence(trip_id)
+    if first_seq is None:
+        return None
+    sw = resolve_search_window(trip_id, first_seq)
     proj = _project_to_trip_distance(trip_id, lat, lon, search_window=sw)
     if proj is None:
         return None
@@ -743,23 +789,29 @@ def decide_trip_lock(scores, gps_count):
 # ============================================================
 def update_passed_sequence(trip_id, current_seq, current_distance_m):
     """
-    現在の current_seq から、次以降の停留所の距離を越えていたら seq をカウントアップする。
+    現在の current_seq から、次以降の停留所の距離を越えていたら seq を進める。
+    TRIP_STOP_TIMES の配列インデックスで「次の停留所」を辿り、返却値は常に GTFS の stop_sequence。
     """
-    if not current_seq:
-        return 1
-    last_seq = _trip_last_sequence(trip_id)
-    if last_seq is None:
-        return current_seq
-    seq = current_seq
-    while seq < last_seq:
-        next_d = _stop_distance_on_trip(trip_id, seq + 1)
+    sts = TRIP_STOP_TIMES.get(trip_id, [])
+    if not sts:
+        return int(current_seq) if current_seq is not None else 1
+    if current_seq is None:
+        return int(sts[0]["stop_sequence"])
+
+    idx = _trip_index_for_sequence(trip_id, current_seq)
+    if idx is None:
+        return int(sts[0]["stop_sequence"])
+
+    while idx < len(sts) - 1:
+        next_seq = int(sts[idx + 1]["stop_sequence"])
+        next_d = _stop_distance_on_trip(trip_id, next_seq)
         if next_d is None:
             break
         if current_distance_m + STOP_PASS_THRESHOLD_M >= next_d:
-            seq += 1
+            idx += 1
         else:
             break
-    return seq
+    return int(sts[idx]["stop_sequence"])
 
 
 def track_locked_trip(trip_id, lat, lon, now_dt, prev_distance_m=None,
@@ -776,8 +828,12 @@ def track_locked_trip(trip_id, lat, lon, now_dt, prev_distance_m=None,
     戻り値に lock_progress_next を含める。
     """
     progress = dict(lock_progress or {})
-    cur_seq = int(progress.get("current_stop_sequence") or 1)
-    max_passed_seq = int(progress.get("max_passed_stop_sequence") or cur_seq)
+    first_seq = _trip_first_stop_sequence(trip_id)
+    _first = int(first_seq) if first_seq is not None else 1
+    raw_cur = progress.get("current_stop_sequence")
+    cur_seq = int(raw_cur) if raw_cur is not None else _first
+    raw_max = progress.get("max_passed_stop_sequence")
+    max_passed_seq = int(raw_max) if raw_max is not None else cur_seq
 
     # 探索範囲（trip起点基準）を計算
     sw = resolve_search_window(trip_id, cur_seq)
@@ -817,7 +873,7 @@ def track_locked_trip(trip_id, lat, lon, now_dt, prev_distance_m=None,
     holding_at_origin = False
     if sched_dep_sec is not None and now_sec < int(sched_dep_sec):
         # まだ出発予定時刻前
-        if current_distance_m < ORIGIN_HOLD_RELEASE_DISTANCE_M and new_seq <= 1:
+        if current_distance_m < ORIGIN_HOLD_RELEASE_DISTANCE_M and first_seq is not None and new_seq <= int(first_seq):
             holding_at_origin = True
 
     if holding_at_origin:
@@ -1125,10 +1181,12 @@ def advance_state(prev_state, lat, lon, now_dt, accepted, accuracy):
             lock["locked_trip_id"] = decided_trip_id
             lock["lock_confirmed_at"] = now_unix
             lock["lock_reason"] = reason
-            # シーケンス追跡の初期化（課題2対応）
+            # シーケンス追跡の初期化（課題2対応）— GTFS 始発の実 stop_sequence を使用
+            _init_seq = _trip_first_stop_sequence(decided_trip_id)
+            _init_seq = int(_init_seq) if _init_seq is not None else 1
             lock["locked_trip_progress"] = {
-                "current_stop_sequence": 1,
-                "max_passed_stop_sequence": 1,
+                "current_stop_sequence": _init_seq,
+                "max_passed_stop_sequence": _init_seq,
                 "last_distance_m": 0.0,
                 "last_updated_at": now_unix,
                 "holding_at_origin": True,
